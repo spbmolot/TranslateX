@@ -123,6 +123,7 @@ from core.pipeline import AppController
 from ui.overlay import TranslationOverlay
 from ui.selector import RegionSelector
 from ui.region_frame import RegionFrame
+from ui.history_panel import HistoryPanel
 from ui.settings_dialog import SettingsDialog
 from ui.tray import SystemTray
 
@@ -196,6 +197,7 @@ class App(QObject):
         self._overlay = TranslationOverlay()
         self._selector = RegionSelector()
         self._frame = RegionFrame()
+        self._history = HistoryPanel()
         self._tray = SystemTray()
 
         self._ocr_ready = False
@@ -203,6 +205,8 @@ class App(QObject):
 
         # Сигналы контроллера
         self._controller.translation_ready.connect(self._on_translation_ready)
+        # История переводов: пишет в HistoryPanel при каждом успешном переводе
+        self._controller.translation_ready.connect(self._history.add_entries)
         self._controller.ocr_ready.connect(self._on_ocr_ready)
         self._controller.status_message.connect(self._tray.set_status)
         # Overlay не должен попадать в кадр захвата
@@ -229,6 +233,7 @@ class App(QObject):
         self._frame.translation_pause_requested.connect(self._controller.pause)
         self._frame.translation_resume_requested.connect(self._controller.resume)
         self._frame.settings_requested.connect(self._show_settings)
+        self._frame.history_requested.connect(self._show_history)
 
         # Сигналы трея
         self._tray.select_region_requested.connect(self._show_selector)
@@ -378,6 +383,13 @@ class App(QObject):
         dialog.settings_saved.connect(self._on_settings_saved)
         dialog.exec_()
 
+    @pyqtSlot()
+    def _show_history(self) -> None:
+        """Открывает (или поднимает) non-modal окно истории переводов."""
+        self._history.show()
+        self._history.raise_()
+        self._history.activateWindow()
+
     @pyqtSlot(object)
     def _on_settings_saved(self, config: configparser.ConfigParser) -> None:
         self._config = config
@@ -397,6 +409,7 @@ class App(QObject):
         logger.info("Завершение TranslateX")
         self._close_frame()
         self._overlay.hide()
+        self._history.hide()
         self._controller.shutdown()
         self._qapp.quit()
 

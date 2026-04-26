@@ -32,6 +32,7 @@ class RegionFrame(QWidget):
     close_requested = pyqtSignal()
     select_region_requested = pyqtSignal()
     settings_requested = pyqtSignal()
+    history_requested = pyqtSignal()
     # Пауза перевода: эмитится при начале drag/resize, resume — через 1.2с после mouseRelease
     translation_pause_requested = pyqtSignal()
     translation_resume_requested = pyqtSignal()
@@ -135,6 +136,13 @@ class RegionFrame(QWidget):
         self._btn_select.setCursor(Qt.PointingHandCursor)
         self._btn_select.clicked.connect(self.select_region_requested)
         layout.addWidget(self._btn_select)
+
+        self._btn_history = QPushButton("🕑", self._toolbar)
+        self._btn_history.setToolTip("История переводов")
+        self._btn_history.setStyleSheet(icon_btn_style)
+        self._btn_history.setCursor(Qt.PointingHandCursor)
+        self._btn_history.clicked.connect(self.history_requested)
+        layout.addWidget(self._btn_history)
 
         self._btn_settings = QPushButton("⚙", self._toolbar)
         self._btn_settings.setToolTip("Настройки")
