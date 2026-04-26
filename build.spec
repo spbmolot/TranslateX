@@ -45,9 +45,9 @@ hidden_imports = [
     # PIL
     "PIL",
     "PIL.Image",
-    # deep-translator
+    # deep-translator (модуль google_trans переименован в google в новых версиях)
     "deep_translator",
-    "deep_translator.google_trans",
+    "deep_translator.google",
     # deepl
     "deepl",
     # mss

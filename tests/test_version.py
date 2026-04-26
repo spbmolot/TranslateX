@@ -50,3 +50,16 @@ def test_version_info_txt_in_sync():
         f"version_info.txt вне синхронизации с core/__version__.py "
         f"({__version__!r}). Запусти: python scripts/sync_version.py"
     )
+
+
+def test_installer_version_iss_in_sync():
+    """installer/version.iss должен определять #define MyAppVersion = текущий __version__."""
+    p = ROOT / "installer" / "version.iss"
+    if not p.exists():
+        pytest.skip("installer/version.iss отсутствует — запусти scripts/sync_version.py")
+    text = p.read_text(encoding="utf-8")
+    expected = f'#define MyAppVersion "{__version__}"'
+    assert expected in text, (
+        f"installer/version.iss вне синхронизации: ожидалось {expected!r}. "
+        f"Запусти: python scripts/sync_version.py"
+    )
