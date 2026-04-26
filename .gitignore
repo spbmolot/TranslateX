@@ -1,0 +1,53 @@
+# Python bytecode / cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# PyInstaller / Inno Setup сборки (тяжёлые артефакты, не нужны в VCS)
+build/
+dist/
+*.spec.bak
+installer_output/
+*.exe
+*.msi
+
+# Локальные логи
+*.log
+translatex.log
+_internal/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Локальные конфиги с секретами (если появятся)
+.env
+*.local.ini
+deepl_api_key.txt
+
+# Кэши моделей EasyOCR (~60 МБ)
+.EasyOCR/
+*.pth.tar
+
+# Временные файлы Cascade/Windsurf
+.windsurf/cache/
+
+# Локальные PID/error файлы фоновых процессов сборки
+*.pid
+*.err
+
+# Local IDE settings
+.claude/
