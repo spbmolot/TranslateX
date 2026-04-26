@@ -79,9 +79,12 @@ class AppController(QObject):
         self._ocr_worker.error.connect(self._on_ocr_error)
         self._ocr_worker.start()
 
-        # Capture timer
+        # Capture timer (single-shot: event-driven reschedule после завершения
+        # OCR/translation вместо постоянного тика — экономит CPU и убирает
+        # лог-спам 'OCR still busy, skipping frame').
         interval = config.getint("general", "capture_interval_ms", fallback=1500)
         self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
         self._timer.setInterval(interval)
         self._timer.timeout.connect(self._on_timer_tick)
 
@@ -223,14 +226,20 @@ class AppController(QObject):
         diff = float(np.abs(sig - prev).mean())
         return diff < threshold
 
+    def _reschedule_tick(self) -> None:
+        """Планирует следующий capture-тик. Таймер single-shot: перезапускается
+        ПОСЛЕ завершения текущего цикла (OCR/translation), а не тикает без остановки.
+        Это убирает 'OCR still busy' лог-спам и освобождает CPU когда цикл идёт."""
+        if self._active and not self._timer.isActive():
+            self._timer.start()
+
     @pyqtSlot()
     def _on_timer_tick(self) -> None:
         self._tick_count += 1
         if not self._active or self._region is None:
             return
-        if self._ocr_busy:
-            logger.debug(f"Tick #{self._tick_count}: OCR still busy, skipping frame")
-            return
+        # _ocr_busy guard не нужен: таймер single-shot останавливается при
+        # запуске OCR job'а и перезапускается в _on_ocr_complete / _on_translation_complete.
         if self._ocr_worker._reader is None:
             # Предупреждаем один раз вместо спама
             if not self._warned_not_ready:
@@ -240,6 +249,8 @@ class AppController(QObject):
                 )
                 self.status_message.emit("Загрузка OCR… подождите")
                 self._warned_not_ready = True
+            # Повторим попытку через interval (когда reader доготовится).
+            self._reschedule_tick()
             return
 
         r = self._region
@@ -285,6 +296,7 @@ class AppController(QObject):
             # перед захватом hide_overlay_for_capture'ом)
             if self._last_translated_blocks is not None and self._region is not None:
                 self.translation_ready.emit(self._last_translated_blocks, self._region)
+            self._reschedule_tick()
             return
         self._frame_skip_count = 0
 
@@ -324,6 +336,7 @@ class AppController(QObject):
                 logger.debug(
                     "OCR вернул 0 блоков: в области нет текста или confidence низкий"
                 )
+            self._reschedule_tick()
             return
 
         # Фильтрация: блоки, которые уже на target-языке — не переводим вообще
@@ -342,6 +355,7 @@ class AppController(QObject):
             self._last_ocr_signature = tuple()
             self._last_translated_blocks = []
             self.translation_ready.emit([], self._region)
+            self._reschedule_tick()
             return
         blocks = filtered
 
@@ -359,6 +373,7 @@ class AppController(QObject):
             # Тихо обновим overlay (на случай если он скрыт после capture)
             if self._region is not None:
                 self.translation_ready.emit(self._last_translated_blocks, self._region)
+            self._reschedule_tick()
             return
         self._last_ocr_signature = signature
 
@@ -402,6 +417,8 @@ class AppController(QObject):
         self._last_translated_blocks = translated_blocks
         if self._region is not None:
             self.translation_ready.emit(translated_blocks, self._region)
+        # Цикл capture→OCR→translate закрыт — планируем следующий capture.
+        self._reschedule_tick()
 
     def shutdown(self) -> None:
         """Clean shutdown — save cache, stop workers, wait for in-flight jobs."""
