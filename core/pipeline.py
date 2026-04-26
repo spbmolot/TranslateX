@@ -55,6 +55,11 @@ class AppController(QObject):
         # перевод не запускаем заново. Кэш для overlay сохраняется в _last_translated.
         self._last_ocr_signature: Optional[tuple] = None
         self._last_translated_blocks: Optional[list] = None
+        # Frame-diff: даунсэмпленая сигнатура последнего кадра. Если новый
+        # кадр почти не изменился — пропускаем OCR (на статичном экране
+        # это экономит 80-95% CPU EasyOCR).
+        self._last_frame_signature: Optional[np.ndarray] = None
+        self._frame_skip_count = 0  # сколько кадров подряд скипнули по diff
 
         # Cache
         self._cache = TranslationCache(
@@ -119,6 +124,10 @@ class AppController(QObject):
         if prev is None or prev != region:
             self._last_ocr_signature = None
             self._last_translated_blocks = None
+            # Сигнатура кадра тоже становится невалидной (другой размер
+            # и другое содержимое — нельзя сравнивать).
+            self._last_frame_signature = None
+            self._frame_skip_count = 0
         logger.info(f"Capture region set: {region}")
 
     @pyqtSlot()
@@ -180,6 +189,38 @@ class AppController(QObject):
         self._cache._ttl = config.getint("general", "cache_ttl_seconds", fallback=3600)
         self._cache._max_size = config.getint("general", "cache_max_size", fallback=500)
 
+    # ── Frame-diff helpers ─────────────────────────────────────────────
+
+    @staticmethod
+    def _frame_signature(image: np.ndarray) -> np.ndarray:
+        """
+        Быстрая сигнатура кадра: даунсемпл до ~32×32 grayscale через stride-индексинг.
+        Стоит ~0.1мс независимо от исходного разрешения. Используется только
+        для сравнения кадров между собой (не для OCR).
+        """
+        h, w = image.shape[:2]
+        sh = max(1, h // 32)
+        sw = max(1, w // 32)
+        # Stride-subsample + усреднение каналов RGB → 2D float32
+        sub = image[::sh, ::sw]
+        if sub.ndim == 3:
+            sub = sub.mean(axis=2)
+        return sub.astype(np.float32)
+
+    def _frame_unchanged(self, image: np.ndarray, threshold: float = 2.0) -> bool:
+        """
+        True если новый кадр практически идентичен предыдущему.
+        threshold=2.0 (на uint8 [0..255]) — устойчив к шуму субпикселей,
+        но чувствителен к реальному изменению текста (обычно diff > 5).
+        """
+        sig = self._frame_signature(image)
+        prev = self._last_frame_signature
+        self._last_frame_signature = sig
+        if prev is None or prev.shape != sig.shape:
+            return False
+        diff = float(np.abs(sig - prev).mean())
+        return diff < threshold
+
     @pyqtSlot()
     def _on_timer_tick(self) -> None:
         self._tick_count += 1
@@ -227,6 +268,23 @@ class AppController(QObject):
             f"Capture #{self._capture_count} OK: shape={image.shape}, "
             f"dtype={image.dtype}, took {cap_ms:.0f}ms"
         )
+
+        # Frame-diff guard: если кадр практически идентичен предыдущему —
+        # OCR не запускаем (экономия CPU на статичных экранах). Через
+        # каждые ~30 скипнутых кадров (≈ 15-45с) всё равно делаем OCR
+        # для синхронизации (вдруг блоки исчезли/появились без визуального
+        # изменения, или модель что-то распознает иначе).
+        if self._frame_unchanged(image) and self._frame_skip_count < 30:
+            self._frame_skip_count += 1
+            logger.debug(
+                f"Frame unchanged (skip #{self._frame_skip_count}), reusing last overlay"
+            )
+            # Переотображаем последний overlay (на случай если он был скрыт
+            # перед захватом hide_overlay_for_capture'ом)
+            if self._last_translated_blocks is not None and self._region is not None:
+                self.translation_ready.emit(self._last_translated_blocks, self._region)
+            return
+        self._frame_skip_count = 0
 
         self._ocr_busy = True
         self._last_ocr_start_ts = time.time()
