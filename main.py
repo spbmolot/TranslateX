@@ -126,6 +126,7 @@ from ui.selector import RegionSelector
 from ui.region_frame import RegionFrame
 from ui.history_panel import HistoryPanel
 from ui.settings_dialog import SettingsDialog
+from ui.theme import apply_theme
 from ui.tray import SystemTray
 
 # Уровень логирования — переключается переменной окружения TRANSLATEX_LOG=DEBUG
@@ -182,6 +183,7 @@ def load_config() -> configparser.ConfigParser:
             "min_confidence": "0.4",
         },
         "ocr": {"gpu": "false"},
+        "ui": {"theme": "auto"},  # auto | light | dark (U3)
     }
     for section, values in defaults.items():
         if not config.has_section(section):
@@ -411,6 +413,8 @@ class App(QObject):
     def _on_settings_saved(self, config: configparser.ConfigParser) -> None:
         self._config = config
         self._controller.reload_config(config)
+        # U3: реаплай темы (вдруг пользователь переключил light↔dark в Настройках).
+        apply_theme(self._qapp, config.get("ui", "theme", fallback="auto"))
         if self._hotkeys_registered:
             try:
                 import keyboard
@@ -477,6 +481,9 @@ def main() -> None:
     qapp.setQuitOnLastWindowClosed(False)
 
     config = load_config()
+
+    # U3: применение темы оформления (auto/light/dark) ДО создания виджетов.
+    apply_theme(qapp, config.get("ui", "theme", fallback="auto"))
 
     # A2: если при валидации config'а нашлись проблемы — показываем
     # неблокирующий QMessageBox.warning со списком (и тем, что починили).

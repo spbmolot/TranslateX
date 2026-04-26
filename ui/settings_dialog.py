@@ -165,6 +165,13 @@ class SettingsDialog(QDialog):
 
         self._auto_font = QCheckBox("Авто-подбор размера шрифта (под DPI экрана)")
         form.addRow(self._auto_font)
+
+        # U3: выбор темы оформления
+        self._theme = QComboBox()
+        self._theme.addItem("Системная (авто)", "auto")
+        self._theme.addItem("Светлая",          "light")
+        self._theme.addItem("Тёмная",           "dark")
+        form.addRow("Тема интерфейса:", self._theme)
         return w
 
     # -------- state --------
@@ -219,6 +226,11 @@ class SettingsDialog(QDialog):
         c["overlay"]["font_size"] = str(self._font_size.value())
         c["overlay"]["auto_font"] = "true" if self._auto_font.isChecked() else "false"
         c["overlay"]["min_confidence"] = str(self._confidence.value())
+
+        # U3: тема
+        if not c.has_section("ui"):
+            c.add_section("ui")
+        c["ui"]["theme"] = self._theme.currentData() or "auto"
 
         try:
             cfg_path = Path(__file__).parent.parent / "config.ini"
