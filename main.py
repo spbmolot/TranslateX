@@ -161,6 +161,7 @@ def load_config() -> configparser.ConfigParser:
         "general": {
             "hotkey_select": "ctrl+shift+t",
             "hotkey_toggle": "ctrl+shift+p",
+            "hotkey_pause": "ctrl+shift+space",
             "capture_interval_ms": "1500",
             "cache_ttl_seconds": "3600",
             "cache_max_size": "500",
@@ -234,6 +235,9 @@ class App(QObject):
         self._frame.translation_resume_requested.connect(self._controller.resume)
         self._frame.settings_requested.connect(self._show_settings)
         self._frame.history_requested.connect(self._show_history)
+        self._frame.pause_toggle_requested.connect(self._controller.toggle_pause)
+        # AppController «пингует» рамку, чтобы она показывала paused/resumed UI.
+        self._controller.user_pause_changed.connect(self._frame.set_paused)
 
         # Сигналы трея
         self._tray.select_region_requested.connect(self._show_selector)
@@ -255,11 +259,13 @@ class App(QObject):
             import keyboard
             hk_select = self._config.get("general", "hotkey_select", fallback="ctrl+shift+t")
             hk_toggle = self._config.get("general", "hotkey_toggle", fallback="ctrl+shift+p")
+            hk_pause = self._config.get("general", "hotkey_pause", fallback="ctrl+shift+space")
 
             keyboard.add_hotkey(hk_select, lambda: QTimer.singleShot(0, self._show_selector), suppress=False)
             keyboard.add_hotkey(hk_toggle, lambda: QTimer.singleShot(0, self._toggle_translation), suppress=False)
+            keyboard.add_hotkey(hk_pause, lambda: QTimer.singleShot(0, self._controller.toggle_pause), suppress=False)
             self._hotkeys_registered = True
-            logger.info(f"Горячие клавиши: {hk_select}, {hk_toggle}")
+            logger.info(f"Горячие клавиши: {hk_select}, {hk_toggle}, {hk_pause} (pause)")
         except Exception as e:
             logger.warning(f"Не удалось зарегистрировать горячие клавиши: {e}")
 

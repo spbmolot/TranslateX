@@ -33,6 +33,7 @@ class RegionFrame(QWidget):
     select_region_requested = pyqtSignal()
     settings_requested = pyqtSignal()
     history_requested = pyqtSignal()
+    pause_toggle_requested = pyqtSignal()  # явный pause/resume пользователем
     # Пауза перевода: эмитится при начале drag/resize, resume — через 1.2с после mouseRelease
     translation_pause_requested = pyqtSignal()
     translation_resume_requested = pyqtSignal()
@@ -121,6 +122,17 @@ class RegionFrame(QWidget):
         self._btn_stop.setVisible(False)
         layout.addWidget(self._btn_stop)
 
+        # Pause/Resume — видим только когда идёт перевод. Toggle button.
+        self._btn_pause = QPushButton("⏸", self._toolbar)
+        self._btn_pause.setStyleSheet(
+            btn_style + "QPushButton { background: #455a64; min-width: 32px; }"
+        )
+        self._btn_pause.setToolTip("Пауза/возобновить (Ctrl+Shift+Space)")
+        self._btn_pause.setCursor(Qt.PointingHandCursor)
+        self._btn_pause.clicked.connect(self.pause_toggle_requested)
+        self._btn_pause.setVisible(False)
+        layout.addWidget(self._btn_pause)
+
         icon_btn_style = """
             QPushButton {
                 color: white; background: transparent;
@@ -188,6 +200,7 @@ class RegionFrame(QWidget):
         self._translating = active
         self._btn_start.setVisible(not active)
         self._btn_stop.setVisible(active)
+        self._btn_pause.setVisible(active)
         if active:
             self._pulse_timer.start()
             self._btn_stop.setText("⏹ Работает")
@@ -195,11 +208,28 @@ class RegionFrame(QWidget):
             self._pulse_timer.stop()
             self._pulse_phase = 0
             self._btn_stop.setText("⏹ Стоп")
+            # Сбросить вид pause при остановке (на случай если был paused)
+            self.set_paused(False)
             # Сброс счётчиков
             self._captures = 0
             self._ocr_blocks_last = 0
             self._translations = 0
         self._update_size_label()
+        self.update()
+
+    @pyqtSlot(bool)
+    def set_paused(self, paused: bool) -> None:
+        """Слот для AppController.user_pause_changed — обновляет UI кнопки и
+        приостанавливает пульсацию rec-индикатора."""
+        if paused:
+            self._btn_pause.setText("▶")
+            self._btn_pause.setToolTip("Возобновить (Ctrl+Shift+Space)")
+            self._pulse_timer.stop()
+        else:
+            self._btn_pause.setText("⏸")
+            self._btn_pause.setToolTip("Пауза (Ctrl+Shift+Space)")
+            if self._translating:
+                self._pulse_timer.start()
         self.update()
 
     @pyqtSlot()

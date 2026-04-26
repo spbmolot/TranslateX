@@ -33,12 +33,17 @@ class AppController(QObject):
     # Статистика для UI
     ocr_progress = pyqtSignal(int)        # число найденных OCR-блоков
     translation_progress = pyqtSignal(int)  # число переведённых блоков
+    user_pause_changed = pyqtSignal(bool)   # True=paused, False=resumed (для UI кнопки)
 
     def __init__(self, config: configparser.ConfigParser, parent=None):
         super().__init__(parent)
         self._config = config
         self._region: Optional[QRect] = None
         self._active = False
+        # Явная пауза от пользователя (hotkey / кнопка). Отличается от
+        # временной auto-паузы при drag/resize рамки: drag-resume не должен
+        # выводить из user-pause, иначе явная пауза самопроизвольно сбрасывалась бы.
+        self._user_paused = False
         self._ocr_busy = False
         self._current_ocr_job: Optional[OcrJobThread] = None
         self._current_trans_job: Optional[TranslationJobThread] = None
@@ -157,6 +162,7 @@ class AppController(QObject):
     @pyqtSlot()
     def stop(self) -> None:
         self._active = False
+        self._user_paused = False  # сброс, чтобы при следующем start() не были на паузе
         self._timer.stop()
         self.status_message.emit("Stopped")
         logger.info(
@@ -181,10 +187,35 @@ class AppController(QObject):
 
     @pyqtSlot()
     def resume(self) -> None:
-        """Возобновляет захват после паузы."""
+        """Возобновляет захват после auto-паузы (drag/resize). Если
+        пользователь поставил явную паузу — игнорируем, она снимается
+        только через toggle_pause()/user_resume()."""
+        if self._user_paused:
+            logger.debug("resume() ignored: user paused explicitly")
+            return
         if self._active and not self._timer.isActive():
             self._timer.start()
             logger.debug("Pipeline resumed (timer restarted)")
+
+    @pyqtSlot()
+    def toggle_pause(self) -> None:
+        """Явная пауза/возобновление пользователем (hotkey или кнопка).
+        Если перевод не активен — no-op."""
+        if not self._active:
+            return
+        if self._user_paused:
+            self._user_paused = False
+            if not self._timer.isActive():
+                self._timer.start()
+            self.status_message.emit("Translating...")
+            self.user_pause_changed.emit(False)
+            logger.info("Pipeline RESUMED by user")
+        else:
+            self._user_paused = True
+            self._timer.stop()
+            self.status_message.emit("Paused")
+            self.user_pause_changed.emit(True)
+            logger.info("Pipeline PAUSED by user")
 
     def reload_config(self, config: configparser.ConfigParser) -> None:
         """Apply updated settings without restarting."""
