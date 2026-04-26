@@ -20,7 +20,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Deque, List, Optional, Tuple
 
-from PyQt5.QtCore import Qt, pyqtSlot
+from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont, QKeySequence
 from PyQt5.QtWidgets import (
     QDialog,
@@ -112,12 +112,15 @@ class HistoryPanel(QDialog):
 
     # ── Public API ─────────────────────────────────────────────────────
 
-    @pyqtSlot(object, object)
     def add_entries(self, translated_blocks, _region) -> None:
         """
         Слот для сигнала AppController.translation_ready(list, QRect).
         Принимает список TranslatedBlock'ов, добавляет новые уникальные
         записи в историю. Region не используется, но обязателен по signature.
+
+        Без @pyqtSlot — декоратор pyqtSlot(object, object) несовместим
+        с типизированным сигналом pyqtSignal(object, QRect) и приводит
+        к TypeError при connect.
         """
         if not translated_blocks:
             return
