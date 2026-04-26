@@ -128,7 +128,9 @@ class AppController(QObject):
             # и другое содержимое — нельзя сравнивать).
             self._last_frame_signature = None
             self._frame_skip_count = 0
-        logger.info(f"Capture region set: {region}")
+        # DEBUG, не INFO: рамку пользователь может двигать десятки раз
+        # в секунду — это засоряло бы production-лог сотнями записей.
+        logger.debug(f"Capture region set: {region}")
 
     @pyqtSlot()
     def start(self) -> None:
