@@ -9,6 +9,8 @@ from PyQt5.QtCore import QObject, pyqtSignal
 from PyQt5.QtGui import QIcon, QPixmap, QColor, QPainter
 from PyQt5.QtWidgets import QAction, QMenu, QSystemTrayIcon
 
+from core.__version__ import __version__
+
 logger = logging.getLogger(__name__)
 
 
@@ -33,7 +35,7 @@ class SystemTray(QObject):
         super().__init__(parent)
         self._active = False
         self._tray = QSystemTrayIcon(parent)
-        self._tray.setToolTip("TranslateX — ожидание")
+        self._tray.setToolTip(f"TranslateX v{__version__} — ожидание")
         self._build_menu()
         self._update_icon()
 
@@ -91,13 +93,16 @@ class SystemTray(QObject):
         self._action_toggle.setText(
             "⏹  Остановить перевод" if active else "▶  Начать перевод"
         )
-        tooltip = "TranslateX — переводим" if active else "TranslateX — ожидание"
+        tooltip = (
+            f"TranslateX v{__version__} — переводим"
+            if active else f"TranslateX v{__version__} — ожидание"
+        )
         self._tray.setToolTip(tooltip)
         self._update_icon()
 
     def set_status(self, message: str) -> None:
-        self._tray.setToolTip(f"TranslateX — {message}")
+        self._tray.setToolTip(f"TranslateX v{__version__} — {message}")
 
     def set_ocr_loading(self) -> None:
-        self._tray.setToolTip("TranslateX — загрузка OCR...")
+        self._tray.setToolTip(f"TranslateX v{__version__} — загрузка OCR...")
         self.set_status("загрузка OCR...")

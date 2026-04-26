@@ -146,8 +146,12 @@ logging.basicConfig(
     handlers=_log_handlers,
 )
 logger = logging.getLogger(__name__)
+try:
+    from core.__version__ import __version__ as _APP_VERSION
+except Exception:  # pragma: no cover
+    _APP_VERSION = "?"
 logger.info(
-    f"TranslateX logging level={_log_level_name}, log file={_LOG_FILE}"
+    f"TranslateX v{_APP_VERSION} | logging={_log_level_name} | log={_LOG_FILE}"
 )
 
 CONFIG_PATH = Path(__file__).parent / "config.ini"

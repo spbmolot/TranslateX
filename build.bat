@@ -37,7 +37,16 @@ if %errorlevel% neq 0 (
 )
 echo [OK] Icons ready.
 
-:: ── Step 3: PyInstaller ──────────────────────────────────────
+:: ── Step 2.5: Sync version into version_info.txt ───────────
+echo.
+echo [STEP 2.5/4] Syncing version from core\__version__.py...
+python scripts\sync_version.py
+if %errorlevel% neq 0 (
+    echo [ERROR] Version sync failed.
+    goto :fail
+)
+
+:: ── Step 3: PyInstaller ──────────────────────────────
 echo.
 echo [STEP 3/4] Building executable with PyInstaller...
 
@@ -104,7 +113,9 @@ if %errorlevel% neq 0 (
     echo [ERROR] Inno Setup compilation failed.
     goto :fail
 )
-echo [OK] Installer created: installer\Output\TranslateX_Setup_1.0.0.exe
+:: Read version back from python for friendly message
+for /f "delims=" %%v in ('python -c "from core.__version__ import __version__;print(__version__)"') do set APP_VERSION=%%v
+echo [OK] Installer created: installer\Output\TranslateX_Setup_%APP_VERSION%.exe
 
 :success
 echo.
@@ -113,8 +124,10 @@ echo   BUILD SUCCESSFUL
 echo ============================================================
 echo.
 echo   Portable app:  dist\TranslateX\TranslateX.exe
-if exist "installer\Output\TranslateX_Setup_1.0.0.exe" (
-echo   Installer:     installer\Output\TranslateX_Setup_1.0.0.exe
+if defined APP_VERSION (
+  if exist "installer\Output\TranslateX_Setup_%APP_VERSION%.exe" (
+    echo   Installer:     installer\Output\TranslateX_Setup_%APP_VERSION%.exe
+  )
 )
 echo.
 pause

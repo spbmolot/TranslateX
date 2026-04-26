@@ -8,14 +8,25 @@
 ; ============================================================
 
 #define MyAppName        "TranslateX"
-#define MyAppVersion     "1.0.0"
 #define MyAppPublisher   "TranslateX"
+; Path to PyInstaller output (relative to this .iss file).
+; Note: this is also referenced below by [Files] section.
+#define BuildDir "..\dist\TranslateX"
+;
+; Версия читается ДИНАМИЧЕСКИ из ресурса скомпилированного TranslateX.exe
+; (который в свою очередь генерируется PyInstaller'ом из version_info.txt,
+;  а тот — из core/__version__.py через scripts/sync_version.py).
+; Это даёт SSOT: версию правишь в одном месте — core/__version__.py.
+#define MyAppExeFull AddBackslash(SourcePath) + BuildDir + "\TranslateX.exe"
+#if FileExists(MyAppExeFull)
+  #define MyAppVersion GetFileVersion(MyAppExeFull)
+#else
+  #pragma warning "\nWARNING: " + MyAppExeFull + " not found — falling back to 0.0.0.\nRun pyinstaller build.spec first."
+  #define MyAppVersion "0.0.0"
+#endif
 #define MyAppURL         "https://github.com/your-repo/translatex"
 #define MyAppExeName     "TranslateX.exe"
 #define MyAppDescription "Real-time screen translation overlay"
-
-; Path to PyInstaller output (relative to this .iss file, adjust if needed)
-#define BuildDir "..\dist\TranslateX"
 
 [Setup]
 AppId={{F3A7B2C1-8D4E-4F9A-B1C2-D3E4F5A6B7C8}

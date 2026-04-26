@@ -13,6 +13,8 @@ from PyQt5.QtWidgets import (
     QTabWidget, QVBoxLayout, QWidget,
 )
 
+from core.__version__ import __version__
+
 logger = logging.getLogger(__name__)
 
 LANGUAGES = [
@@ -41,7 +43,7 @@ class SettingsDialog(QDialog):
     def __init__(self, config: configparser.ConfigParser, parent=None):
         super().__init__(parent)
         self._config = config
-        self.setWindowTitle("TranslateX — Настройки")
+        self.setWindowTitle(f"TranslateX v{__version__} — Настройки")
         self.setMinimumWidth(480)
         self.setMinimumHeight(420)
         self._build_ui()
