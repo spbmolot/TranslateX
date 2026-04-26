@@ -119,6 +119,7 @@ set_dpi_awareness()
 from PyQt5.QtCore import QObject, QRect, Qt, pyqtSlot, QTimer
 from PyQt5.QtWidgets import QApplication
 
+from core.config_validator import validate_and_fix, log_issues
 from core.pipeline import AppController
 from ui.overlay import TranslationOverlay
 from ui.selector import RegionSelector
@@ -188,6 +189,12 @@ def load_config() -> configparser.ConfigParser:
         for key, value in values.items():
             if not config.has_option(section, key):
                 config.set(section, key, value)
+
+    # A2: валидация значений (типы/диапазоны/whitelist) после применения
+    # дефолтов. Битые поля чинятся in-place — приложение всегда стартует
+    # с рабочим config'ом. issues вернутся в main() для показа пользователю.
+    config._validation_issues = validate_and_fix(config)  # type: ignore[attr-defined]
+    log_issues(config._validation_issues)  # type: ignore[attr-defined]
     return config
 
 
@@ -470,6 +477,21 @@ def main() -> None:
     qapp.setQuitOnLastWindowClosed(False)
 
     config = load_config()
+
+    # A2: если при валидации config'а нашлись проблемы — показываем
+    # неблокирующий QMessageBox.warning со списком (и тем, что починили).
+    issues = getattr(config, "_validation_issues", []) or []
+    if issues:
+        from PyQt5.QtWidgets import QMessageBox
+        details = "\n".join(f"• {m}" for m in issues)
+        QMessageBox.warning(
+            None,
+            "TranslateX — config.ini",
+            "Некоторые значения в config.ini были неверны и заменены на "
+            "значения по умолчанию:\n\n" + details +
+            "\n\nИсправленный конфиг сохранится при следующем 'Сохранить' в Настройках.",
+        )
+
     app = App(qapp, config)
 
     sys.exit(qapp.exec_())
