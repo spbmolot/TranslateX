@@ -131,12 +131,48 @@ def _build_palette(dark: bool) -> QPalette:
     return p
 
 
+# ── Текущий режим + акцентные цвета для кастомных виджетов ───────────────────
+# RegionFrame и overlay рисуются вручную через QPainter и НЕ управляются QSS.
+# Чтобы они тоже следовали теме, держим текущий режим в модульной переменной
+# и отдаём цвета через accent()/frame_colors(). apply_theme() обновляет режим.
+_current_mode: Literal["light", "dark"] = "light"
+
+
+def current_mode() -> Literal["light", "dark"]:
+    return _current_mode
+
+
+def frame_colors() -> dict:
+    """
+    Палитра для RegionFrame (рамка + тулбар) под текущую тему.
+    Ключи: toolbar_top, toolbar_bottom, idle_border, active_border, sublabel.
+    """
+    if _current_mode == "dark":
+        return {
+            "toolbar_top": "#1a1a2e",
+            "toolbar_bottom": "#16213e",
+            "idle_border": "#4fc3f7",
+            "active_border": "#ff5252",
+            "sublabel": "#8899aa",
+        }
+    # light
+    return {
+        "toolbar_top": "#3a4a6b",
+        "toolbar_bottom": "#2b3a57",
+        "idle_border": "#2d7be5",
+        "active_border": "#e53935",
+        "sublabel": "#c5d2e8",
+    }
+
+
 def apply_theme(qapp: QApplication, mode: ThemeMode = "auto") -> str:
     """
     Применяет тему. Возвращает фактически применённый режим
     ("light" или "dark") — удобно для лога.
     """
+    global _current_mode
     resolved = resolve_mode(mode)
+    _current_mode = resolved
     qss = DARK_QSS if resolved == "dark" else LIGHT_QSS
     qapp.setStyleSheet(qss)
     qapp.setPalette(_build_palette(resolved == "dark"))

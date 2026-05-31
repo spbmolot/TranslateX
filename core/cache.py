@@ -4,18 +4,17 @@ Thread-safe for concurrent reads; writes are serialized via a lock.
 """
 import json
 import logging
-import os
 import re
 import threading
 import time
 from collections import OrderedDict
-from pathlib import Path
 from typing import Optional, Tuple
+
+from core.paths import cache_path, user_data_dir
 
 logger = logging.getLogger(__name__)
 
-_APPDATA = Path(os.environ.get("APPDATA", "~")).expanduser() / "TranslateX"
-_CACHE_FILE = _APPDATA / "cache.json"
+_CACHE_FILE = cache_path()
 
 
 def _normalize(text: str) -> str:
@@ -60,7 +59,7 @@ class TranslationCache:
 
     def save(self) -> None:
         try:
-            _APPDATA.mkdir(parents=True, exist_ok=True)
+            user_data_dir()  # гарантируем существование %APPDATA%\TranslateX
             serializable = {
                 f"{k[0]}||{k[1]}": list(v)
                 for k, v in self._data.items()

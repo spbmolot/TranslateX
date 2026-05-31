@@ -112,9 +112,26 @@ class RegionSelector(QWidget):
             painter.setPen(pen)
             painter.drawRect(local_sel)
 
-            # Dimensions label
+            # Dimensions label с полупрозрачной плашкой (#4) — читается на любом фоне.
             label = f"{sel.width()} × {sel.height()}"
+            fm = painter.fontMetrics()
+            tw = fm.horizontalAdvance(label)
+            th = fm.height()
+            pad_x, pad_y = 6, 3
+            # Плашку рисуем НАД рамкой; если места сверху нет — внутри сверху.
+            bx = local_sel.x()
+            by = local_sel.y() - th - pad_y * 2 - 2
+            if by < 0:
+                by = local_sel.y() + 2
+            bw = tw + pad_x * 2
+            bh = th + pad_y * 2
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(20, 20, 30, 200))
+            painter.drawRoundedRect(bx, by, bw, bh, 4, 4)
             painter.setPen(QColor("#ffffff"))
-            painter.drawText(local_sel.x() + 4, local_sel.y() - 6, label)
+            painter.drawText(
+                bx, by, bw, bh,
+                Qt.AlignCenter, label,
+            )
 
         painter.end()

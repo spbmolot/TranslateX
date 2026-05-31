@@ -4,13 +4,58 @@ Runs in a dedicated QThread to avoid blocking the Qt event loop.
 EasyOCR Reader is initialized once (slow ~3-10s) before first use.
 """
 import logging
+import os
+import shutil
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
 from PyQt5.QtCore import QThread, pyqtSignal
 
 logger = logging.getLogger(__name__)
+
+
+def _bundled_model_dir() -> Optional[Path]:
+    """
+    Папка с моделями, вшитыми в сборку PyInstaller.
+    В onedir-сборке data-файлы с dest "model" лежат в <_MEIPASS>/model.
+    В dev-режиме (не frozen) вернёт None.
+    """
+    base = getattr(sys, "_MEIPASS", None)
+    if not base:
+        return None
+    d = Path(base) / "model"
+    return d if d.is_dir() else None
+
+
+def ensure_bundled_models() -> None:
+    """
+    Копирует вшитые в .exe модели EasyOCR в пользовательскую папку
+    ~/.EasyOCR/model, если их там ещё нет.
+
+    Зачем: EasyOCR по умолчанию ищет (и качает) модели в ~/.EasyOCR/model.
+    Мы кладём базовые модели (детектор CRAFT + cyrillic_g2, покрывающий ru+en)
+    прямо в дистрибутив, чтобы первый запуск работал офлайн — без скачивания
+    ~100 МБ. Недостающие модели для других языков EasyOCR при необходимости
+    докачает в эту же (записываемую) папку штатным образом.
+    """
+    src = _bundled_model_dir()
+    if src is None:
+        return  # dev-режим — ничего не копируем
+    dst = Path.home() / ".EasyOCR" / "model"
+    try:
+        dst.mkdir(parents=True, exist_ok=True)
+        for model_file in src.iterdir():
+            if not model_file.is_file():
+                continue
+            target = dst / model_file.name
+            if not target.exists():
+                shutil.copy2(model_file, target)
+                logger.info(f"Bundled OCR model installed: {model_file.name}")
+    except Exception as e:
+        logger.warning(f"Could not pre-install bundled OCR models: {e}")
 
 
 @dataclass
@@ -44,6 +89,9 @@ class OcrWorker(QThread):
         self._running = True
         try:
             import easyocr
+            # Скопировать вшитые модели в ~/.EasyOCR/model, чтобы первый запуск
+            # шёл офлайн (без скачивания ~100 МБ) для базовых языков.
+            ensure_bundled_models()
             logger.info(f"Initializing EasyOCR for languages: {self._languages}")
             logger.info(f"GPU acceleration: {'enabled' if self._use_gpu else 'disabled'}")
             self._reader = easyocr.Reader(
@@ -58,8 +106,11 @@ class OcrWorker(QThread):
             self.error.emit(str(e))
             return
 
-        while self._running:
-            self.msleep(50)  # idle; actual work triggered by process()
+        # Reader готов. Дальше реальный OCR делают отдельные OcrJobThread'ы,
+        # а этот поток должен просто спать до stop(). Используем Qt event loop
+        # (exec_) вместо busy-loop `while: msleep(50)` — тот будил CPU 20 раз/сек
+        # впустую. quit() из stop() корректно завершает exec_().
+        self.exec_()
 
     def process(self, image: np.ndarray) -> None:
         """

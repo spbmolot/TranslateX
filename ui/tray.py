@@ -6,23 +6,19 @@ import logging
 from pathlib import Path
 
 from PyQt5.QtCore import QObject, pyqtSignal
-from PyQt5.QtGui import QIcon, QPixmap, QColor, QPainter
+from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import QAction, QMenu, QSystemTrayIcon
 
 from core.__version__ import __version__
+from ui import icons
 
 logger = logging.getLogger(__name__)
 
 
 def _make_default_icon(active: bool = False) -> QIcon:
-    pixmap = QPixmap(32, 32)
-    color = QColor("#4fc3f7") if active else QColor("#546e7a")
-    pixmap.fill(color)
-    painter = QPainter(pixmap)
-    painter.setPen(QColor("#ffffff"))
-    painter.drawText(pixmap.rect(), 0x84, "TX")
-    painter.end()
-    return QIcon(pixmap)
+    """Скруглённая иконка с буквой «T» и акцентной точкой (приятнее
+    залитого серого квадрата с «TX»)."""
+    return icons.app_icon(active)
 
 
 class SystemTray(QObject):

@@ -61,6 +61,14 @@ PrivilegesRequiredOverridesAllowed=dialog
 ; Minimum Windows version: Windows 10
 MinVersion=10.0
 
+; TranslateX — 64-битное приложение (torch). Ставим в «настоящий» Program Files
+; и работаем с 64-битным представлением реестра.
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
+
+; Запоминаем каталог прошлой установки — обновление идёт «на место».
+UsePreviousAppDir=yes
+
 ; Allow silent install via /SILENT or /VERYSILENT
 AllowNoIcons=yes
 
@@ -105,26 +113,157 @@ Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChang
 Filename: "taskkill.exe"; Parameters: "/F /IM {#MyAppExeName}"; Flags: runhidden skipifdoesntexist; RunOnceId: "KillTranslateX"
 
 [Code]
-// ──────────────────────────────────────────────────────────
-// Check for existing installation and offer to close the app
-// ──────────────────────────────────────────────────────────
-function InitializeSetup(): Boolean;
+// ════════════════════════════════════════════════════════════════════════
+//  Версионирование и качественное обновление
+//
+//  При запуске установщик:
+//    1. Считывает версию уже установленного TranslateX из реестра
+//       (ключ удаления Inno: <AppId>_is1, поле DisplayVersion).
+//    2. Сравнивает её с версией дистрибутива {#MyAppVersion}.
+//    3. Показывает осмысленное сообщение:
+//         • нет установки   → обычная установка;
+//         • старее          → предложение обновить (X → Y);
+//         • та же версия    → предложение переустановить (восстановить);
+//         • новее           → предупреждение о даунгрейде.
+//    4. Перед копированием закрывает запущенное приложение, а при обновлении
+//       вычищает файлы прошлой версии (onedir = тысячи файлов), чтобы не
+//       осталось «висящих» артефактов. Пользовательские данные в
+//       %APPDATA%\TranslateX НЕ затрагиваются.
+// ════════════════════════════════════════════════════════════════════════
+
+const
+  UninstallKey =
+    'Software\Microsoft\Windows\CurrentVersion\Uninstall\' +
+    '{F3A7B2C1-8D4E-4F9A-B1C2-D3E4F5A6B7C8}_is1';
+
+var
+  gInstalledVersion: String;
+  gIsUpgrade: Boolean;
+
+// Версия уже установленного TranslateX (из реестра). Проверяем оба
+// представления реестра (64/32) + HKCU — на случай прежних сборок.
+function GetInstalledVersion(var Version: String): Boolean;
 begin
-  Result := True;
+  Version := '';
+  Result :=
+    RegQueryStringValue(HKLM64, UninstallKey, 'DisplayVersion', Version) or
+    RegQueryStringValue(HKLM32, UninstallKey, 'DisplayVersion', Version) or
+    RegQueryStringValue(HKCU,   UninstallKey, 'DisplayVersion', Version);
 end;
 
-// Show a friendly welcome note about first-run OCR download
+// Сравнение версий вида "a.b.c": -1 если A<B, 0 если равны, 1 если A>B.
+function CompareVersions(A, B: String): Integer;
+var
+  na, nb, pa, pb: Integer;
+begin
+  Result := 0;
+  while ((Length(A) > 0) or (Length(B) > 0)) and (Result = 0) do
+  begin
+    pa := Pos('.', A);
+    if pa > 0 then begin
+      na := StrToIntDef(Copy(A, 1, pa - 1), 0);
+      Delete(A, 1, pa);
+    end else begin
+      na := StrToIntDef(A, 0);
+      A := '';
+    end;
+
+    pb := Pos('.', B);
+    if pb > 0 then begin
+      nb := StrToIntDef(Copy(B, 1, pb - 1), 0);
+      Delete(B, 1, pb);
+    end else begin
+      nb := StrToIntDef(B, 0);
+      B := '';
+    end;
+
+    if na < nb then Result := -1
+    else if na > nb then Result := 1;
+  end;
+end;
+
+function InitializeSetup(): Boolean;
+var
+  cmp: Integer;
+begin
+  Result := True;
+  gIsUpgrade := False;
+
+  if not GetInstalledVersion(gInstalledVersion) then
+    Exit;  // свежая установка — без вопросов
+
+  cmp := CompareVersions(gInstalledVersion, '{#MyAppVersion}');
+
+  if cmp < 0 then
+  begin
+    gIsUpgrade := True;
+    if MsgBox('Установлена версия TranslateX ' + gInstalledVersion + '.' + #13#10 +
+              'Обновить до версии {#MyAppVersion}?' + #13#10 + #13#10 +
+              'Ваши настройки и история переводов будут сохранены.',
+              mbConfirmation, MB_YESNO) = IDNO then
+      Result := False;
+  end
+  else if cmp = 0 then
+  begin
+    gIsUpgrade := True;
+    if MsgBox('TranslateX версии {#MyAppVersion} уже установлена.' + #13#10 +
+              'Переустановить (восстановить файлы программы)?',
+              mbConfirmation, MB_YESNO) = IDNO then
+      Result := False;
+  end
+  else
+  begin
+    gIsUpgrade := True;
+    if MsgBox('Внимание: установлена БОЛЕЕ НОВАЯ версия TranslateX ' +
+              gInstalledVersion + '.' + #13#10 +
+              'Сейчас вы устанавливаете более старую версию {#MyAppVersion} (откат).'
+              + #13#10 + #13#10 + 'Продолжить?',
+              mbError, MB_YESNO) = IDNO then
+      Result := False;
+  end;
+end;
+
+// Перед копированием файлов: закрыть запущенный TranslateX и (при обновлении)
+// удалить файлы прошлой версии, чтобы не осталось устаревших артефактов.
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
+begin
+  Result := '';
+
+  // Завершаем процесс (безвредно, если он не запущен).
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM {#MyAppExeName}',
+       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Sleep(800);
+
+  if gIsUpgrade then
+  begin
+    // Чистим только каталог программы; %APPDATA%\TranslateX не трогаем.
+    DelTree(ExpandConstant('{app}\_internal'), True, True, True);
+    DeleteFile(ExpandConstant('{app}\{#MyAppExeName}'));
+  end;
+end;
+
+// Дружелюбное сообщение после установки.
 procedure CurStepChanged(CurStep: TSetupStep);
+var
+  head: String;
 begin
   if CurStep = ssPostInstall then
   begin
+    if gIsUpgrade then
+      head := 'TranslateX обновлён до версии {#MyAppVersion}!'
+    else
+      head := 'TranslateX {#MyAppVersion} установлен!';
+
     MsgBox(
-      'TranslateX has been installed!' + #13#10 + #13#10 +
-      'On first launch, the OCR engine will download language models (~100 MB).' + #13#10 +
-      'Please ensure you have an internet connection for the first run.' + #13#10 + #13#10 +
-      'Hotkeys (configurable in Settings):' + #13#10 +
-      '  Ctrl+Shift+T — Select screen region' + #13#10 +
-      '  Ctrl+Shift+P — Toggle translation on/off',
+      head + #13#10 + #13#10 +
+      'Базовые модели распознавания (русский + английский) уже включены в' + #13#10 +
+      'комплект — приложение работает сразу, без скачивания.' + #13#10 +
+      'Модели для других языков будут загружены при необходимости.' + #13#10 + #13#10 +
+      'Горячие клавиши (настраиваются в Настройках):' + #13#10 +
+      '  Ctrl+Shift+T — выбрать область экрана' + #13#10 +
+      '  Ctrl+Shift+P — включить/выключить перевод',
       mbInformation,
       MB_OK
     );

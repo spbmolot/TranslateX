@@ -115,12 +115,12 @@ class AppController(QObject):
         logger.info("OCR engine ready")
         self._warned_not_ready = False
         self.ocr_ready.emit()
-        self.status_message.emit("OCR ready")
+        self.status_message.emit("OCR готов")
 
     @pyqtSlot(str)
     def _on_ocr_error(self, msg: str):
         logger.error(f"OCR error: {msg}")
-        self.status_message.emit(f"OCR error: {msg}")
+        self.status_message.emit(f"Ошибка OCR: {msg}")
 
     @pyqtSlot(QRect)
     def set_region(self, region: QRect) -> None:
@@ -143,7 +143,7 @@ class AppController(QObject):
     @pyqtSlot()
     def start(self) -> None:
         if self._region is None:
-            self.status_message.emit("Select a region first (hotkey)")
+            self.status_message.emit("Сначала выберите область")
             return
         self._active = True
         self._tick_count = 0
@@ -151,7 +151,7 @@ class AppController(QObject):
         self._ocr_count = 0
         self._trans_count = 0
         self._timer.start()
-        self.status_message.emit("Translating...")
+        self.status_message.emit("Перевод…")
         reader_ok = self._ocr_worker._reader is not None
         logger.info(
             f"Pipeline started. region={self._region.width()}x{self._region.height()}, "
@@ -164,7 +164,7 @@ class AppController(QObject):
         self._active = False
         self._user_paused = False  # сброс, чтобы при следующем start() не были на паузе
         self._timer.stop()
-        self.status_message.emit("Stopped")
+        self.status_message.emit("Остановлено")
         logger.info(
             f"Pipeline stopped. ticks={self._tick_count}, captures={self._capture_count}, "
             f"ocr_jobs={self._ocr_count}, translations={self._trans_count}"
@@ -207,13 +207,13 @@ class AppController(QObject):
             self._user_paused = False
             if not self._timer.isActive():
                 self._timer.start()
-            self.status_message.emit("Translating...")
+            self.status_message.emit("Перевод…")
             self.user_pause_changed.emit(False)
             logger.info("Pipeline RESUMED by user")
         else:
             self._user_paused = True
             self._timer.stop()
-            self.status_message.emit("Paused")
+            self.status_message.emit("Пауза")
             self.user_pause_changed.emit(True)
             logger.info("Pipeline PAUSED by user")
 

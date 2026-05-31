@@ -4,7 +4,6 @@
 """
 import configparser
 import logging
-from pathlib import Path
 
 from PyQt5.QtCore import pyqtSignal
 from PyQt5.QtWidgets import (
@@ -14,6 +13,7 @@ from PyQt5.QtWidgets import (
 )
 
 from core.__version__ import __version__
+from core.paths import config_path, user_data_dir
 
 logger = logging.getLogger(__name__)
 
@@ -153,7 +153,10 @@ class SettingsDialog(QDialog):
         form = QFormLayout(w)
 
         self._opacity = QDoubleSpinBox()
-        self._opacity.setRange(0.1, 1.0)
+        # Нижняя граница 0.0 — полностью прозрачный фон (дефолт приложения:
+        # текст рисуется обводкой без подложки). Раньше min=0.1 клампил 0.0→0.1
+        # и при сохранении необратимо включал фоновую подложку.
+        self._opacity.setRange(0.0, 1.0)
         self._opacity.setSingleStep(0.05)
         self._opacity.setDecimals(2)
         form.addRow("Непрозрачность фона:", self._opacity)
@@ -196,9 +199,14 @@ class SettingsDialog(QDialog):
         self._gpu.setChecked(c.getboolean("ocr", "gpu", fallback=False))
         self._confidence.setValue(c.getfloat("overlay", "min_confidence", fallback=0.4))
 
-        self._opacity.setValue(c.getfloat("overlay", "opacity", fallback=0.85))
+        self._opacity.setValue(c.getfloat("overlay", "opacity", fallback=0.0))
         self._font_size.setValue(c.getint("overlay", "font_size", fallback=13))
         self._auto_font.setChecked(c.getboolean("overlay", "auto_font", fallback=True))
+
+        # U3: тема интерфейса. Без этой загрузки комбобокс всегда показывал
+        # индекс 0 ("авто") и при «Сохранить» молча перезаписывал выбор
+        # пользователя (light/dark) обратно на auto.
+        self._select_combo(self._theme, c.get("ui", "theme", fallback="auto"))
 
     def _select_combo(self, combo: QComboBox, value: str) -> None:
         for i in range(combo.count()):
@@ -233,7 +241,8 @@ class SettingsDialog(QDialog):
         c["ui"]["theme"] = self._theme.currentData() or "auto"
 
         try:
-            cfg_path = Path(__file__).parent.parent / "config.ini"
+            user_data_dir()  # гарантируем существование %APPDATA%\TranslateX
+            cfg_path = config_path()
             with open(cfg_path, "w", encoding="utf-8") as f:
                 c.write(f)
         except Exception as e:

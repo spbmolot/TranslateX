@@ -128,13 +128,16 @@ from ui.history_panel import HistoryPanel
 from ui.settings_dialog import SettingsDialog
 from ui.theme import apply_theme
 from ui.tray import SystemTray
+from core.paths import config_path, log_path, user_data_dir, ensure_user_config
 
 # Уровень логирования — переключается переменной окружения TRANSLATEX_LOG=DEBUG
 _log_level_name = os.environ.get("TRANSLATEX_LOG", "INFO").upper()
 _log_level = getattr(logging, _log_level_name, logging.INFO)
 
-# Файл лога рядом с файлом конфига (для отладки)
-_LOG_FILE = Path(__file__).parent / "translatex.log"
+# Файл лога — в пользовательской папке (%APPDATA%\TranslateX), а не рядом с .exe:
+# Program Files доступен только на чтение, и апдейт не должен затирать лог.
+user_data_dir()  # гарантируем существование каталога до открытия лог-файла
+_LOG_FILE = log_path()
 _log_handlers = [logging.StreamHandler(sys.stdout)]
 try:
     _log_handlers.append(logging.FileHandler(str(_LOG_FILE), mode="w", encoding="utf-8"))
@@ -156,10 +159,14 @@ logger.info(
     f"TranslateX v{_APP_VERSION} | logging={_log_level_name} | log={_LOG_FILE}"
 )
 
-CONFIG_PATH = Path(__file__).parent / "config.ini"
+# Пользовательский config.ini — в %APPDATA%\TranslateX. ensure_user_config()
+# при первом запуске мигрирует config от прежней установки или создаёт его из
+# дефолтного шаблона, вшитого в дистрибутив.
+CONFIG_PATH = config_path()
 
 
 def load_config() -> configparser.ConfigParser:
+    ensure_user_config()
     config = configparser.ConfigParser()
     if CONFIG_PATH.exists():
         config.read(str(CONFIG_PATH), encoding="utf-8")
@@ -288,6 +295,8 @@ class App(QObject):
     def _on_ocr_ready(self) -> None:
         self._ocr_ready = True
         self._tray.set_status("готов")
+        # Скрываем индикатор «загрузка OCR…» в тулбаре рамки.
+        self._frame.set_ocr_ready()
         logger.info("OCR-движок инициализирован")
 
     # ── Выбор области ────────────────────────────────────────────────
@@ -415,6 +424,8 @@ class App(QObject):
         self._controller.reload_config(config)
         # U3: реаплай темы (вдруг пользователь переключил light↔dark в Настройках).
         apply_theme(self._qapp, config.get("ui", "theme", fallback="auto"))
+        # Перекрасить кастомную рамку (тулбар/бордюр рисуются вручную, не через QSS).
+        self._frame.refresh_theme()
         if self._hotkeys_registered:
             try:
                 import keyboard

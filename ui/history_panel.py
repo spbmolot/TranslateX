@@ -82,7 +82,10 @@ class HistoryPanel(QDialog):
         # Список записей
         self._list = QListWidget(self)
         self._list.setAlternatingRowColors(True)
-        mono = QFont("Consolas, Courier New, monospace")
+        # QFont принимает ОДНО имя семейства, не CSS-стек. Список альтернатив
+        # задаём через setFamilies(); styleHint — общий fallback на моноширинный.
+        mono = QFont()
+        mono.setFamilies(["Consolas", "Courier New", "monospace"])
         mono.setStyleHint(QFont.Monospace)
         self._list.setFont(mono)
         root.addWidget(self._list, 1)
@@ -137,6 +140,12 @@ class HistoryPanel(QDialog):
             key = (original, translated)
             if key in self._seen_keys:
                 continue
+            # Если deque заполнен — append вытеснит самую старую запись.
+            # Снимаем её ключ из _seen_keys, иначе set растёт неограниченно
+            # и вытесненная пара уже никогда не сможет добавиться повторно.
+            if len(self._entries) == self._entries.maxlen:
+                old_ts, old_orig, old_tr = self._entries[0]
+                self._seen_keys.discard((old_orig, old_tr))
             self._seen_keys.add(key)
             self._entries.append((ts, original, translated))
             added += 1

@@ -6,9 +6,9 @@ TranslationOverlay — прозрачный, click-through, always-on-top сло
 import logging
 from typing import List
 
-from PyQt5.QtCore import QRect, Qt, pyqtSlot
+from PyQt5.QtCore import QEasingCurve, QPropertyAnimation, QRect, Qt, pyqtSlot
 from PyQt5.QtGui import QColor, QFont, QPainter, QPen, QBrush, QFontMetrics
-from PyQt5.QtWidgets import QWidget, QApplication
+from PyQt5.QtWidgets import QWidget
 
 from core.translator import TranslatedBlock
 from utils import geometry
@@ -17,30 +17,6 @@ from utils import win32_utils
 logger = logging.getLogger(__name__)
 
 _PADDING = 5  # px around text
-
-
-def _dpi_scale_for_widget(widget) -> float:
-    """
-    DPI scale экрана, на котором сейчас находится виджет (а не primary).
-    Используется для подбора шрифта на multi-monitor: HiDPI-второй монитор
-    получает свой множитель.
-    """
-    try:
-        screen = None
-        if widget is not None:
-            handle = widget.windowHandle()
-            if handle is not None:
-                screen = handle.screen()
-            if screen is None:
-                center = widget.geometry().center()
-                screen = QApplication.screenAt(center)
-        if screen is None:
-            screen = QApplication.primaryScreen()
-        if screen is not None:
-            return screen.logicalDotsPerInch() / 96.0
-    except Exception:
-        pass
-    return 1.0
 
 
 class TranslationOverlay(QWidget):
@@ -65,6 +41,13 @@ class TranslationOverlay(QWidget):
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setWindowOpacity(1.0)
 
+        # Плавное появление (#5): анимация windowOpacity 0→1 при первом show.
+        self._fade = QPropertyAnimation(self, b"windowOpacity", self)
+        self._fade.setDuration(160)
+        self._fade.setStartValue(0.0)
+        self._fade.setEndValue(1.0)
+        self._fade.setEasingCurve(QEasingCurve.OutCubic)
+
     def _apply_click_through(self) -> None:
         try:
             hwnd = win32_utils.get_hwnd(self)
@@ -73,9 +56,18 @@ class TranslationOverlay(QWidget):
             logger.warning(f"Не удалось включить click-through: {e}")
 
     def show_overlay(self) -> None:
+        was_hidden = not self.isVisible()
         self._visible = True
         self.show()
         self._apply_click_through()
+        # Fade-in только когда окно реально появляется с нуля (а не при
+        # per-frame restore_after_capture, иначе моргало бы каждый кадр).
+        if was_hidden:
+            try:
+                self._fade.stop()
+                self._fade.start()
+            except Exception:
+                self.setWindowOpacity(1.0)
         # Подписываемся на смену экрана ОДИН раз (флаг-guard), чтобы избежать
         # дублирующих connect'ов при повторных show_overlay. Без декоратора
         # @pyqtSlot — сигнал screenChanged(QScreen*) несовместим с pyqtSlot(object)
