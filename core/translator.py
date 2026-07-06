@@ -4,6 +4,8 @@ Supports Google Translate (via deep-translator, free) and DeepL API.
 Runs in a QThread to avoid blocking the event loop.
 """
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -14,6 +16,37 @@ from core.ocr import TextBlock
 
 logger = logging.getLogger(__name__)
 
+# PERF-011: deep_translator.google зовёт модульный requests.get на каждый
+# перевод — каждый вызов платит TCP+TLS handshake (~150-400мс). Session.get
+# сигнатурно совместим с requests.get, поэтому подменяем модульную ссылку
+# на Session с connection pooling — соединение к translate.google.com
+# переиспользуется между вызовами и потоками (Session потокобезопасен).
+_keepalive_lock = threading.Lock()
+_keepalive_installed = False
+
+
+def _install_keepalive_session() -> None:
+    global _keepalive_installed
+    if _keepalive_installed:
+        return
+    with _keepalive_lock:
+        if _keepalive_installed:
+            return
+        try:
+            import requests
+            import deep_translator.google as _dtg
+            session = requests.Session()
+            adapter = requests.adapters.HTTPAdapter(
+                pool_connections=4, pool_maxsize=8
+            )
+            session.mount("https://", adapter)
+            session.mount("http://", adapter)
+            _dtg.requests = session
+            _keepalive_installed = True
+            logger.debug("Keep-alive session installed for deep_translator")
+        except Exception as e:
+            logger.debug(f"Keep-alive session not installed: {e}")
+
 
 @dataclass
 class TranslatedBlock:
@@ -21,6 +54,9 @@ class TranslatedBlock:
     translated: str
     bbox: List[List[int]]  # same format as TextBlock.bbox
     confidence: float
+    # Цвет фона под блоком (r, g, b) для inpaint-отрисовки; копируется
+    # из TextBlock.bg_rgb. None → overlay рисует fallback-обводку.
+    bg_rgb: Optional[Tuple[int, int, int]] = None
 
 
 # Диапазоны Unicode для определения языка по тексту.
@@ -86,42 +122,61 @@ class TranslationJobThread(QThread):
         self._cache = cache
 
     def run(self) -> None:
-        results = []
-        texts_to_translate: List[Tuple[int, str]] = []  # (index, text)
+        n = len(self._blocks)
+        # None = перевода нет (fail или ещё не переведено). Фейлы НЕ кэшируем:
+        # раньше при сбое сети оригинал записывался в кэш как «перевод» и
+        # блок оставался непереведённым весь TTL (1 час) даже после
+        # восстановления связи.
+        translations: List[Optional[str]] = [None] * n
+        to_translate: List[Tuple[int, str]] = []  # (index, text)
 
         # Check cache first
         for i, block in enumerate(self._blocks):
-            cached = self._cache.get(block.text, self._target)
+            cached = self._cache.get(
+                block.text, self._target, self._source, self._provider
+            )
             if cached is not None:
-                results.append((i, cached))
+                translations[i] = cached
             else:
-                texts_to_translate.append((i, block.text))
+                to_translate.append((i, block.text))
 
         # Batch translate cache misses
-        if texts_to_translate:
-            translations = self._translate_batch(
-                [t for _, t in texts_to_translate]
-            )
-            for (idx, original), translation in zip(texts_to_translate, translations):
-                self._cache.put(original, self._target, translation)
-                results.append((idx, translation))
+        if to_translate:
+            fresh = self._translate_batch([t for _, t in to_translate])
+            failed = 0
+            for (idx, original), translation in zip(to_translate, fresh):
+                if translation is None:
+                    failed += 1
+                    continue  # показываем оригинал, кэш не трогаем — retry на следующем тике
+                self._cache.put(
+                    original, self._target, translation,
+                    self._source, self._provider,
+                )
+                translations[idx] = translation
+            if failed:
+                logger.warning(
+                    f"{failed}/{len(to_translate)} block(s) failed to translate "
+                    "(originals shown, not cached — will retry next tick)"
+                )
 
-        # Re-sort by original index and build output
-        results.sort(key=lambda x: x[0])
-        translated_blocks = []
-        for i, (_, translation) in enumerate(results):
-            block = self._blocks[i]
-            translated_blocks.append(TranslatedBlock(
+        translated_blocks = [
+            TranslatedBlock(
                 original=block.text,
-                translated=translation,
+                translated=tr if tr is not None else block.text,
                 bbox=block.bbox,
                 confidence=block.confidence,
-            ))
+                bg_rgb=getattr(block, "bg_rgb", None),
+            )
+            for block, tr in zip(self._blocks, translations)
+        ]
 
         self.translation_complete.emit(translated_blocks)
 
-    def _translate_batch(self, texts: List[str]) -> List[str]:
-        """Translate a list of texts, returning translations in same order."""
+    def _translate_batch(self, texts: List[str]) -> List[Optional[str]]:
+        """
+        Translate a list of texts, preserving order.
+        Per-item None = перевод не удался (не кэшировать, показать оригинал).
+        """
         if not texts:
             return []
 
@@ -132,23 +187,35 @@ class TranslationJobThread(QThread):
                 return self._translate_google(texts)
         except Exception as e:
             logger.error(f"Translation error: {e}")
-            return texts  # Fallback: return originals
+            return [None] * len(texts)
 
-    def _translate_google(self, texts: List[str]) -> List[str]:
+    def _google_one(self, text: str) -> Optional[str]:
+        """Перевод одной строки. Никогда не бросает; None = fail.
+        Каждый вызов создаёт свой GoogleTranslator: translate() мутирует
+        внутренний _url_params, инстанс нельзя разделять между потоками.
+        Создание объекта дёшево; дорогой TLS-handshake решён keep-alive
+        Session'ом (см. _install_keepalive_session)."""
         from deep_translator import GoogleTranslator
-        source = self._source if self._source != "auto" else "auto"
-        translator = GoogleTranslator(source=source, target=self._target)
-        results = []
-        for text in texts:
-            try:
-                translated = translator.translate(text)
-                results.append(translated or text)
-            except Exception as e:
-                logger.warning(f"Google translate failed for {text!r}: {e}")
-                results.append(text)
-        return results
+        try:
+            translator = GoogleTranslator(source=self._source or "auto",
+                                          target=self._target)
+            translated = translator.translate(text)
+            return translated if translated else None
+        except Exception as e:
+            logger.warning(f"Google translate failed for {text!r}: {e}")
+            return None
 
-    def _translate_deepl(self, texts: List[str]) -> List[str]:
+    def _translate_google(self, texts: List[str]) -> List[Optional[str]]:
+        _install_keepalive_session()
+        # PERF-004: cache-miss блоки переводим параллельно. HTTP-запросы
+        # I/O-bound, GIL не мешает; 4 воркера * keep-alive session — 5 блоков
+        # идут ~за время одного запроса вместо суммы всех.
+        if len(texts) == 1:
+            return [self._google_one(texts[0])]
+        with ThreadPoolExecutor(max_workers=min(4, len(texts))) as pool:
+            return list(pool.map(self._google_one, texts))
+
+    def _translate_deepl(self, texts: List[str]) -> List[Optional[str]]:
         import deepl
         client = deepl.Translator(self._deepl_key)
         source = self._source.upper() if self._source != "auto" else None
@@ -160,7 +227,7 @@ class TranslationJobThread(QThread):
             return [result.text]
         except Exception as e:
             logger.error(f"DeepL batch translate failed: {e}")
-            return texts
+            return [None] * len(texts)
 
     def _map_deepl_lang(self, lang: str) -> str:
         """Map ISO language codes to DeepL target language codes."""

@@ -182,14 +182,29 @@ def load_config() -> configparser.ConfigParser:
         "languages": {"source_lang": "auto", "target_lang": "ru"},
         "translation": {"provider": "google", "deepl_api_key": ""},
         "overlay": {
-            "opacity": "0.0",  # прозрачный фон по умолчанию: текст рисуется с обводкой
+            # inpaint: bbox заливается сэмплированным цветом фона, оригинал
+            # полностью скрыт (стиль Google Lens). outline — прежний стиль:
+            # текст с обводкой поверх оригинала.
+            "style": "inpaint",
+            # Исключать overlay из захвата экрана (WDA_EXCLUDEFROMCAPTURE,
+            # Win10 2004+): перевод не мерцает при каждом кадре. false —
+            # прежний hide/show (или если exclusion глючит на конкретной
+            # машине — проверка: scripts/check_capture_exclusion.py).
+            "exclude_from_capture": "true",
+            "opacity": "0.0",  # для style=outline: прозрачный фон, текст с обводкой
             "font_size": "13",
             "auto_font": "true",
             "font_color": "#ffffff",
             "bg_color": "#1a1a2e",
             "min_confidence": "0.4",
         },
-        "ocr": {"gpu": "false"},
+        "ocr": {
+            "gpu": "false",
+            # Склейка OCR-строк в абзацы перед переводом (качество перевода)
+            "group_paragraphs": "true",
+            # PERF-002: даунсэмпл кадра перед OCR: auto | off | коэффициент 0..1
+            "downscale": "auto",
+        },
         "ui": {"theme": "auto"},  # auto | light | dark (U3)
     }
     for section, values in defaults.items():
@@ -400,6 +415,9 @@ class App(QObject):
             font_color=self._config.get("overlay", "font_color", fallback="#ffffff"),
             bg_color=self._config.get("overlay", "bg_color", fallback="#1a1a2e"),
             auto_font=self._config.getboolean("overlay", "auto_font", fallback=True),
+            style=self._config.get("overlay", "style", fallback="inpaint"),
+            exclude_from_capture=self._config.getboolean(
+                "overlay", "exclude_from_capture", fallback=True),
         )
         self._overlay.update_blocks(blocks, region)
 

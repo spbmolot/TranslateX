@@ -112,6 +112,23 @@ def test_unchanged_detects_real_change():
     assert c._frame_unchanged(with_text) is False
 
 
+def test_unchanged_detects_small_local_change_in_large_frame():
+    """Регрессия: одно изменившееся слово в большом регионе.
+    Глобальный mean размывал такой diff до <2 и кадр считался неизменным
+    (до ~45 с устаревшего перевода). Тайловый максимум обязан заметить."""
+    c = _FakeController()
+    big = np.full((1080, 1920, 3), 240, dtype=np.uint8)  # светлый фон
+    changed = big.copy()
+    changed[500:522, 800:920] = 30  # «слово» ~120×22 px сменило цвет
+    c._frame_unchanged(big)
+    # Проверим, что глобальный mean действительно был бы слеп (доказательство бага)
+    sig_a = AppController._frame_signature(big)
+    sig_b = AppController._frame_signature(changed)
+    assert float(np.abs(sig_a - sig_b).mean()) < 2.0
+    # ...а тайловый метод изменение видит
+    assert c._frame_unchanged(changed) is False
+
+
 def test_unchanged_resets_on_shape_mismatch():
     """Смена размера региона — сигнатура другой формы, должна вернуть False."""
     c = _FakeController()

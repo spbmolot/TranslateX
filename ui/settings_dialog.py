@@ -18,7 +18,9 @@ from core.paths import config_path, user_data_dir
 logger = logging.getLogger(__name__)
 
 LANGUAGES = [
-    ("auto", "Авто-определение"),
+    # «auto» намеренно НЕ обещает «авто-определение»: EasyOCR требует список
+    # языков заранее, при auto распознаются только латиница + язык перевода.
+    ("auto", "Авто (латиница + язык перевода)"),
     ("en", "Английский"),
     ("ru", "Русский"),
     ("de", "Немецкий"),
@@ -103,6 +105,15 @@ class SettingsDialog(QDialog):
                 self._target_lang.addItem(name, code)
         form.addRow("Исходный язык:", self._source_lang)
         form.addRow("Язык перевода:", self._target_lang)
+
+        note = QLabel(
+            "<small><i>Режим «Авто» распознаёт только английский и язык "
+            "перевода: OCR-движку нужен список языков заранее. Для японского, "
+            "китайского, корейского или арабского выберите исходный язык явно "
+            "— иначе текст не будет распознан вовсе.</i></small>"
+        )
+        note.setWordWrap(True)
+        form.addRow(note)
         return w
 
     def _build_tab_provider(self) -> QWidget:
@@ -138,12 +149,32 @@ class SettingsDialog(QDialog):
         note.setWordWrap(True)
         v.addWidget(note)
 
+        self._group_paragraphs = QCheckBox(
+            "Склеивать строки в абзацы перед переводом (лучше качество)"
+        )
+        v.addWidget(self._group_paragraphs)
+        gp_note = QLabel(
+            "<small><i>Соседние строки одного текста переводятся как целые "
+            "предложения, а не построчно. Отключите, если переводите "
+            "таблицы/списки, где каждая строка самостоятельна.</i></small>"
+        )
+        gp_note.setWordWrap(True)
+        v.addWidget(gp_note)
+
         form = QFormLayout()
         self._confidence = QDoubleSpinBox()
         self._confidence.setRange(0.0, 1.0)
         self._confidence.setSingleStep(0.05)
         self._confidence.setDecimals(2)
         form.addRow("Мин. уверенность OCR:", self._confidence)
+
+        # PERF-002: даунсэмпл кадра перед распознаванием
+        self._downscale = QComboBox()
+        self._downscale.addItem("Авто (сжимать высокие кадры)", "auto")
+        self._downscale.addItem("Выключен (макс. качество)", "off")
+        self._downscale.addItem("×0.75", "0.75")
+        self._downscale.addItem("×0.5 (макс. скорость)", "0.5")
+        form.addRow("Сжатие кадра перед OCR:", self._downscale)
         v.addLayout(form)
         v.addStretch(1)
         return w
@@ -151,6 +182,11 @@ class SettingsDialog(QDialog):
     def _build_tab_overlay(self) -> QWidget:
         w = QWidget()
         form = QFormLayout(w)
+
+        self._style = QComboBox()
+        self._style.addItem("Закрашивать оригинал (как Google Lens)", "inpaint")
+        self._style.addItem("Текст с обводкой поверх оригинала", "outline")
+        form.addRow("Стиль перевода:", self._style)
 
         self._opacity = QDoubleSpinBox()
         # Нижняя граница 0.0 — полностью прозрачный фон (дефолт приложения:
@@ -197,8 +233,12 @@ class SettingsDialog(QDialog):
         self._deepl_key.setText(c.get("translation", "deepl_api_key", fallback=""))
 
         self._gpu.setChecked(c.getboolean("ocr", "gpu", fallback=False))
+        self._group_paragraphs.setChecked(
+            c.getboolean("ocr", "group_paragraphs", fallback=True))
         self._confidence.setValue(c.getfloat("overlay", "min_confidence", fallback=0.4))
+        self._select_combo(self._downscale, c.get("ocr", "downscale", fallback="auto"))
 
+        self._select_combo(self._style, c.get("overlay", "style", fallback="inpaint"))
         self._opacity.setValue(c.getfloat("overlay", "opacity", fallback=0.0))
         self._font_size.setValue(c.getint("overlay", "font_size", fallback=13))
         self._auto_font.setChecked(c.getboolean("overlay", "auto_font", fallback=True))
@@ -229,7 +269,11 @@ class SettingsDialog(QDialog):
         if not c.has_section("ocr"):
             c.add_section("ocr")
         c["ocr"]["gpu"] = "true" if self._gpu.isChecked() else "false"
+        c["ocr"]["group_paragraphs"] = (
+            "true" if self._group_paragraphs.isChecked() else "false")
+        c["ocr"]["downscale"] = self._downscale.currentData() or "auto"
 
+        c["overlay"]["style"] = self._style.currentData() or "inpaint"
         c["overlay"]["opacity"] = str(self._opacity.value())
         c["overlay"]["font_size"] = str(self._font_size.value())
         c["overlay"]["auto_font"] = "true" if self._auto_font.isChecked() else "false"

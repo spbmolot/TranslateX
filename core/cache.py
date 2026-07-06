@@ -28,15 +28,25 @@ class TranslationCache:
     def __init__(self, max_size: int = 500, ttl_seconds: int = 3600):
         self._max_size = max_size
         self._ttl = ttl_seconds
-        self._data: OrderedDict[Tuple[str, str], Tuple[str, float]] = OrderedDict()
+        self._data: OrderedDict[Tuple[str, ...], Tuple[str, float]] = OrderedDict()
         self._lock = threading.Lock()
         self.load()
 
-    def _key(self, text: str, target_lang: str) -> Tuple[str, str]:
-        return (_normalize(text), target_lang.lower())
+    def _key(self, text: str, target_lang: str,
+             source_lang: str = "auto", provider: str = "google") -> Tuple[str, ...]:
+        # Ключ включает source и provider: перевод en→ru у Google и DeepL
+        # различается, и смена провайдера/источника не должна отдавать
+        # устаревшие записи другого провайдера.
+        return (
+            _normalize(text),
+            target_lang.lower(),
+            (source_lang or "auto").lower(),
+            (provider or "google").lower(),
+        )
 
-    def get(self, text: str, target_lang: str) -> Optional[str]:
-        key = self._key(text, target_lang)
+    def get(self, text: str, target_lang: str,
+            source_lang: str = "auto", provider: str = "google") -> Optional[str]:
+        key = self._key(text, target_lang, source_lang, provider)
         with self._lock:
             if key not in self._data:
                 return None
@@ -48,8 +58,9 @@ class TranslationCache:
             self._data.move_to_end(key)
             return translation
 
-    def put(self, text: str, target_lang: str, translation: str) -> None:
-        key = self._key(text, target_lang)
+    def put(self, text: str, target_lang: str, translation: str,
+            source_lang: str = "auto", provider: str = "google") -> None:
+        key = self._key(text, target_lang, source_lang, provider)
         with self._lock:
             if key in self._data:
                 self._data.move_to_end(key)
@@ -61,7 +72,7 @@ class TranslationCache:
         try:
             user_data_dir()  # гарантируем существование %APPDATA%\TranslateX
             serializable = {
-                f"{k[0]}||{k[1]}": list(v)
+                "||".join(k): list(v)
                 for k, v in self._data.items()
             }
             with open(_CACHE_FILE, "w", encoding="utf-8") as f:
@@ -78,13 +89,15 @@ class TranslationCache:
                 raw = json.load(f)
             now = time.time()
             for composite_key, value in raw.items():
-                parts = composite_key.split("||", 1)
-                if len(parts) != 2:
+                parts = composite_key.split("||")
+                # 4 части: text||target||source||provider. Записи старого
+                # 2-компонентного формата отбрасываем (разовый сброс кэша
+                # при обновлении — дешевле, чем неверные попадания).
+                if len(parts) != 4:
                     continue
-                text_key, lang = parts
                 translation, ts = value
                 if now - ts <= self._ttl:
-                    self._data[(text_key, lang)] = (translation, ts)
+                    self._data[tuple(parts)] = (translation, ts)
             logger.debug(f"Cache loaded: {len(self._data)} entries")
         except Exception as e:
             logger.warning(f"Failed to load cache: {e}")

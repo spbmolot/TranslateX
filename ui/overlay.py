@@ -29,7 +29,13 @@ class TranslationOverlay(QWidget):
         self._auto_font = True
         self._font_color = QColor("#ffffff")
         self._bg_color = QColor("#1a1a2e")
+        self._style = "inpaint"
         self._visible = False
+        # WDA_EXCLUDEFROMCAPTURE: окно исключено из захвата экрана — overlay
+        # не нужно прятать перед каждым кадром (убирает мерцание ~1.5с).
+        # Проверено эмпирически с mss/BitBlt (scripts/check_capture_exclusion.py).
+        self._exclude_from_capture = True   # желаемый режим (из конфига)
+        self._capture_excluded = False      # фактически применено к HWND
 
         self.setWindowFlags(
             Qt.FramelessWindowHint |
@@ -54,6 +60,28 @@ class TranslationOverlay(QWidget):
             win32_utils.set_click_through(hwnd)
         except Exception as e:
             logger.warning(f"Не удалось включить click-through: {e}")
+        self._apply_capture_exclusion()
+
+    def _apply_capture_exclusion(self) -> None:
+        """Применяет/снимает исключение окна из захвата по _exclude_from_capture.
+        При успехе hide_overlay_for_capture/restore_after_capture становятся
+        no-op — overlay не мерцает. При неуспехе (старая Windows, нет DWM)
+        остаётся прежний hide/show fallback."""
+        try:
+            hwnd = win32_utils.get_hwnd(self)
+            if self._exclude_from_capture and not self._capture_excluded:
+                self._capture_excluded = win32_utils.set_exclude_from_capture(hwnd)
+                if self._capture_excluded:
+                    logger.info("Overlay исключён из захвата экрана (без мерцания)")
+                else:
+                    logger.info(
+                        "WDA_EXCLUDEFROMCAPTURE недоступен — fallback hide/show"
+                    )
+            elif not self._exclude_from_capture and self._capture_excluded:
+                win32_utils.unset_exclude_from_capture(hwnd)
+                self._capture_excluded = False
+        except Exception as e:
+            logger.warning(f"Не удалось применить capture-exclusion: {e}")
 
     def show_overlay(self) -> None:
         was_hidden = not self.isVisible()
@@ -102,13 +130,19 @@ class TranslationOverlay(QWidget):
 
     @pyqtSlot()
     def hide_overlay_for_capture(self) -> None:
-        """Временно скрыть overlay перед захватом экрана, чтобы он не попал в кадр."""
+        """Временно скрыть overlay перед захватом экрана, чтобы он не попал в кадр.
+        Если окно исключено из захвата (WDA_EXCLUDEFROMCAPTURE) — прятать
+        не нужно, no-op (перевод не мерцает)."""
+        if self._capture_excluded:
+            return
         if self._visible:
             self.hide()
 
     @pyqtSlot()
     def restore_after_capture(self) -> None:
         """Вернуть overlay после захвата."""
+        if self._capture_excluded:
+            return
         if self._visible and self._blocks:
             self.show()
             self._apply_click_through()
@@ -128,12 +162,21 @@ class TranslationOverlay(QWidget):
 
     def apply_config(self, opacity: float, font_size: int,
                      font_color: str, bg_color: str,
-                     auto_font: bool = True) -> None:
+                     auto_font: bool = True,
+                     style: str = "inpaint",
+                     exclude_from_capture: bool = True) -> None:
         self._opacity = opacity
         self._font_size = font_size
         self._auto_font = auto_font
         self._font_color = QColor(font_color)
         self._bg_color = QColor(bg_color)
+        # 'inpaint' — залить bbox сэмплированным цветом фона и рисовать
+        # контрастный текст (стиль Google Lens, оригинал полностью скрыт);
+        # 'outline' — прежний стиль: текст с обводкой поверх оригинала.
+        self._style = style
+        self._exclude_from_capture = exclude_from_capture
+        if self.isVisible():
+            self._apply_capture_exclusion()
         self.update()
 
     def _effective_font_size(self) -> int:
@@ -217,17 +260,34 @@ class TranslationOverlay(QWidget):
             font = self._fit_font_size(text, inner_w, inner_h, min_pt=7, max_pt=max_pt)
             painter.setFont(font)
 
-            # Полупрозрачная подложка (если включена настройками)
+            text_rect_x = bx + _PADDING
+            text_rect_y = by
+            text_flags = Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignVCenter
+
+            inpaint_rgb = getattr(block, "bg_rgb", None)
+            if self._style == "inpaint" and inpaint_rgb is not None:
+                # Inpaint-стиль (Google Lens): bbox непрозрачно заливается
+                # сэмплированным цветом фона — оригинальный текст полностью
+                # скрыт, перевод рисуется контрастным цветом. Никакого
+                # «двойного текста».
+                r, g, b = inpaint_rgb
+                painter.setBrush(QBrush(QColor(r, g, b)))
+                painter.setPen(Qt.NoPen)
+                painter.drawRoundedRect(bx, by, bw, bh, 2, 2)
+                lum = 0.299 * r + 0.587 * g + 0.114 * b
+                text_color = QColor(20, 20, 20) if lum >= 140 else QColor(255, 255, 255)
+                painter.setPen(QPen(text_color))
+                painter.drawText(
+                    text_rect_x, text_rect_y, inner_w, inner_h, text_flags, text,
+                )
+                continue
+
+            # Fallback-стиль 'outline' (или блок без bg_rgb):
+            # полупрозрачная подложка (если включена настройками)
             if has_bg:
                 painter.setBrush(QBrush(bg))
                 painter.setPen(Qt.NoPen)
                 painter.drawRoundedRect(bx, by, bw, bh, 3, 3)
-
-            # Текст рисуем на всю высоту bbox, без отступа сверху,
-            # чтобы базовая линия совпадала с оригиналом.
-            text_rect_x = bx + _PADDING
-            text_rect_y = by
-            text_flags = Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignVCenter
 
             # Тёмная обводка текста (stroke) — даёт читаемость без "синего фона".
             # Рисуем текст 4 раза с offset ±1, затем основной цвет.

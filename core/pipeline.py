@@ -14,7 +14,9 @@ from PyQt5.QtWidgets import QApplication
 
 from core.cache import TranslationCache
 from core.capture import capture_to_numpy
+from core.inpaint import apply_bg_colors
 from core.ocr import OcrWorker, OcrJobThread, TextBlock
+from core.paragraphs import group_paragraphs
 from core.translator import TranslationJobThread, TranslatedBlock, is_already_in_lang
 
 logger = logging.getLogger(__name__)
@@ -64,7 +66,10 @@ class AppController(QObject):
         # кадр почти не изменился — пропускаем OCR (на статичном экране
         # это экономит 80-95% CPU EasyOCR).
         self._last_frame_signature: Optional[np.ndarray] = None
+        self._last_frame_shape: Optional[tuple] = None
         self._frame_skip_count = 0  # сколько кадров подряд скипнули по diff
+        # Последний захваченный кадр — для сэмплирования цвета фона (inpaint)
+        self._last_capture_image: Optional[np.ndarray] = None
 
         # Cache
         self._cache = TranslationCache(
@@ -99,6 +104,15 @@ class AppController(QObject):
         langs = set()
         if source != "auto":
             langs.add(source[:2])
+        else:
+            # «Авто» — НЕ автоопределение: EasyOCR требует список языков до
+            # инициализации Reader'а. Фактически распознаются en + target;
+            # CJK/арабский при auto не распознаются вовсе (это отражено в UI).
+            logger.info(
+                "source_lang=auto: OCR ограничен языками en+%s. "
+                "Для CJK/арабского нужно выбрать исходный язык явно.",
+                target[:2],
+            )
         langs.add(target[:2])
         # Always include English as fallback
         langs.add("en")
@@ -135,6 +149,7 @@ class AppController(QObject):
             # Сигнатура кадра тоже становится невалидной (другой размер
             # и другое содержимое — нельзя сравнивать).
             self._last_frame_signature = None
+            self._last_frame_shape = None
             self._frame_skip_count = 0
         # DEBUG, не INFO: рамку пользователь может двигать десятки раз
         # в секунду — это засоряло бы production-лог сотнями записей.
@@ -230,32 +245,58 @@ class AppController(QObject):
     @staticmethod
     def _frame_signature(image: np.ndarray) -> np.ndarray:
         """
-        Быстрая сигнатура кадра: даунсемпл до ~32×32 grayscale через stride-индексинг.
-        Стоит ~0.1мс независимо от исходного разрешения. Используется только
-        для сравнения кадров между собой (не для OCR).
+        Сигнатура кадра: даунсемпл до ≤32×32 grayscale через cv2.INTER_AREA.
+        Именно area-усреднение (а не stride-сэмплинг, как раньше): при stride
+        строка текста ниже шага сэмплирования (напр. 22px при шаге 33 на 1080p)
+        могла целиком попасть МЕЖДУ выборками и изменение не замечалось вовсе.
+        INTER_AREA учитывает каждый пиксель; стоит ~1-2мс на 1080p — раз в тик
+        (1.5с) это пренебрежимо. Используется только для сравнения кадров.
         """
-        h, w = image.shape[:2]
-        sh = max(1, h // 32)
-        sw = max(1, w // 32)
-        # Stride-subsample + усреднение каналов RGB → 2D float32
-        sub = image[::sh, ::sw]
-        if sub.ndim == 3:
-            sub = sub.mean(axis=2)
-        return sub.astype(np.float32)
+        import cv2
+        if image.ndim == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = image
+        h, w = gray.shape[:2]
+        out_w = min(32, w)
+        out_h = min(32, h)
+        sig = cv2.resize(gray, (out_w, out_h), interpolation=cv2.INTER_AREA)
+        return sig.astype(np.float32)
 
-    def _frame_unchanged(self, image: np.ndarray, threshold: float = 2.0) -> bool:
+    def _frame_unchanged(self, image: np.ndarray, threshold: float = 4.0) -> bool:
         """
         True если новый кадр практически идентичен предыдущему.
-        threshold=2.0 (на uint8 [0..255]) — устойчив к шуму субпикселей,
-        но чувствителен к реальному изменению текста (обычно diff > 5).
+
+        Сравниваем НЕ глобальное среднее (оно размывает локальные изменения:
+        одно изменившееся слово в большом регионе давало mean < 2 и кадр
+        считался «неизменным» до 30 скипов подряд ≈ 45 с устаревшего перевода),
+        а максимум по тайлам ~4×4 сигнатуры — worst-case локальный diff.
+        threshold=4.0 (на uint8 [0..255]) — выше шума субпикселей/антиалиасинга
+        (тайловый mean шума ±1 ≈ 0.5), но любое реальное изменение текста
+        даёт в своём тайле diff ≥ 15-20.
         """
         sig = self._frame_signature(image)
         prev = self._last_frame_signature
+        prev_shape = getattr(self, "_last_frame_shape", None)
         self._last_frame_signature = sig
-        if prev is None or prev.shape != sig.shape:
+        self._last_frame_shape = image.shape
+        # Сигнатура теперь всегда ≤32×32, поэтому смену размера региона
+        # ловим по shape исходного кадра, а не по shape сигнатуры.
+        if prev is None or prev.shape != sig.shape or prev_shape != image.shape:
             return False
-        diff = float(np.abs(sig - prev).mean())
-        return diff < threshold
+        diff = np.abs(sig - prev)
+        h, w = diff.shape
+        th, tw = max(1, h // 8), max(1, w // 8)
+        hh, ww = (h // th) * th, (w // tw) * tw
+        tiles = diff[:hh, :ww].reshape(hh // th, th, ww // tw, tw).mean(axis=(1, 3))
+        # Хвостовые строки/столбцы, не кратные тайлу, учитываем отдельно,
+        # чтобы изменение у правого/нижнего края не потерялось.
+        tile_max = float(tiles.max())
+        if ww < w:
+            tile_max = max(tile_max, float(diff[:, ww:].mean()))
+        if hh < h:
+            tile_max = max(tile_max, float(diff[hh:, :].mean()))
+        return tile_max < threshold
 
     def _reschedule_tick(self) -> None:
         """Планирует следующий capture-тик. Таймер single-shot: перезапускается
@@ -333,10 +374,14 @@ class AppController(QObject):
 
         self._ocr_busy = True
         self._last_ocr_start_ts = time.time()
+        # Кадр нужен в _on_ocr_complete для сэмплирования цвета фона
+        # под inpaint-подложку overlay.
+        self._last_capture_image = image
         job = OcrJobThread(
             reader=self._ocr_worker._reader,
             image=image,
             min_confidence=self._config.getfloat("overlay", "min_confidence", fallback=0.4),
+            downscale=self._config.get("ocr", "downscale", fallback="auto"),
             parent=self,
         )
         job.ocr_complete.connect(self._on_ocr_complete)
@@ -369,6 +414,21 @@ class AppController(QObject):
                 )
             self._reschedule_tick()
             return
+
+        # Группировка построчных OCR-блоков в абзацы: переводчик получает
+        # связные предложения вместо разорванных строк (ключевое качество
+        # перевода — «как Яндекс», а не построчная каша).
+        if self._config.getboolean("ocr", "group_paragraphs", fallback=True):
+            grouped = group_paragraphs(blocks)
+            if len(grouped) != len(blocks):
+                logger.debug(
+                    f"Paragraph grouping: {len(blocks)} line(s) → "
+                    f"{len(grouped)} block(s)"
+                )
+            blocks = grouped
+
+        # Цвет фона под каждым блоком (для inpaint-подложки overlay).
+        apply_bg_colors(getattr(self, "_last_capture_image", None), blocks)
 
         # Фильтрация: блоки, которые уже на target-языке — не переводим вообще
         # (например, русский → русский). На overlay их тоже не показываем,

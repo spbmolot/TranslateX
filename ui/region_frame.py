@@ -257,6 +257,16 @@ class RegionFrame(QWidget):
         self._update_size_label()
         self.show()
         self.raise_()
+        # Рамка не должна попадать в захват: скруглённые углы бордюра
+        # залезают на пару пикселей внутрь области OCR. Best-effort —
+        # на старых Windows API вернёт False, это не критично.
+        if not getattr(self, "_capture_excluded", False):
+            try:
+                from utils import win32_utils
+                self._capture_excluded = win32_utils.set_exclude_from_capture(
+                    win32_utils.get_hwnd(self))
+            except Exception:
+                self._capture_excluded = False
 
     def set_translating(self, active: bool) -> None:
         self._translating = active

@@ -29,11 +29,12 @@ def _make_config(overrides: dict[str, dict[str, str]] | None = None) -> configpa
         "languages": {"source_lang": "auto", "target_lang": "ru"},
         "translation": {"provider": "google", "deepl_api_key": ""},
         "overlay": {
+            "style": "inpaint", "exclude_from_capture": "true",
             "opacity": "0.0", "font_size": "13", "auto_font": "true",
             "font_color": "#ffffff", "bg_color": "#1a1a2e",
             "min_confidence": "0.4",
         },
-        "ocr": {"gpu": "false"},
+        "ocr": {"gpu": "false", "group_paragraphs": "true", "downscale": "auto"},
     })
     if overrides:
         for section, kvs in overrides.items():

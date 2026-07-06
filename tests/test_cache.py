@@ -21,7 +21,7 @@ def test_ttl_expiry():
     cache = TranslationCache(max_size=10, ttl_seconds=1)
     cache.put("Hello", "ru", "Привет")
     # Manually backdate the timestamp
-    key = ("hello", "ru")
+    key = ("hello", "ru", "auto", "google")
     text, _ = cache._data[key]
     cache._data[key] = (text, time.time() - 2)
     assert cache.get("Hello", "ru") is None

@@ -180,6 +180,9 @@ def validate_and_fix(config: configparser.ConfigParser) -> List[str]:
         config.set("translation", "provider", "google")
 
     # ── [overlay] ─────────────────────────────────────────────
+    _check_str  (config, "overlay", "style", "inpaint",
+                 issues, allowed={"inpaint", "outline"}, label="Стиль overlay")
+    _check_bool (config, "overlay", "exclude_from_capture", True, issues)
     _check_float(config, "overlay", "opacity", 0.0, 0.0, 1.0, issues)
     _check_int  (config, "overlay", "font_size", 13, 6, 72, issues)
     _check_bool (config, "overlay", "auto_font", True, issues)
@@ -191,6 +194,20 @@ def validate_and_fix(config: configparser.ConfigParser) -> List[str]:
 
     # ── [ocr] ─────────────────────────────────────────────────
     _check_bool(config, "ocr", "gpu", False, issues)
+    _check_bool(config, "ocr", "group_paragraphs", True, issues)
+    # downscale: "auto" | "off" | float 0.1..1.0
+    raw_ds = (config.get("ocr", "downscale", fallback="auto") or "").strip().lower()
+    if raw_ds not in ("auto", "off"):
+        try:
+            v = float(raw_ds)
+            if not (0.1 <= v < 1.0):
+                raise ValueError
+        except (TypeError, ValueError):
+            issues.append(
+                f"[ocr].downscale = {raw_ds!r} — ожидается auto/off/число 0.1..1.0 "
+                "— применено 'auto'."
+            )
+            config.set("ocr", "downscale", "auto")
 
     # ── [ui] (опциональная секция темы — A2 + U3) ─────────────
     if config.has_section("ui"):

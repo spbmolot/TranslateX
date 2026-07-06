@@ -1,5 +1,9 @@
 PyQt5>=5.15.0
 mss>=9.0.0
+# easyocr тянет torch. На Windows PyPI-колёса torch — CPU-only (то, что нужно).
+# На Linux/CI НЕ ставьте CUDA-torch: используйте
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+# иначе dist распухнет с ~1 ГБ до ~3 ГБ (PERF-008).
 easyocr>=1.7.0
 deep-translator>=1.11.0
 deepl>=1.17.0

@@ -71,3 +71,58 @@ def test_result_stored_in_cache(mock_translate):
     mock_translate.reset_mock()
     _run_job(blocks, cache=cache)
     mock_translate.assert_not_called()
+
+
+@patch("core.translator.TranslationJobThread._translate_google")
+def test_api_error_does_not_poison_cache(mock_translate):
+    """Фейл перевода НЕ должен кэшироваться: после восстановления API
+    следующий тик обязан снова дёрнуть перевод, а не отдать оригинал из кэша."""
+    cache = TranslationCache(max_size=10, ttl_seconds=3600)
+    blocks = [_make_block("Hello")]
+
+    # 1-й прогон: API лежит → показываем оригинал
+    mock_translate.side_effect = RuntimeError("API down")
+    result = _run_job(blocks, cache=cache)
+    assert result[0].translated == "Hello"
+
+    # 2-й прогон: API ожил → должен быть вызван снова и вернуть перевод
+    mock_translate.side_effect = None
+    mock_translate.return_value = ["Привет"]
+    result = _run_job(blocks, cache=cache)
+    mock_translate.assert_called()
+    assert result[0].translated == "Привет"
+
+
+@patch("core.translator.TranslationJobThread._translate_google")
+def test_partial_failure_caches_only_successes(mock_translate):
+    """None в ответе батча = fail конкретного блока: оригинал показан,
+    в кэш не попал; успешные соседи закэшированы."""
+    cache = TranslationCache(max_size=10, ttl_seconds=3600)
+    blocks = [_make_block("One"), _make_block("Two")]
+    mock_translate.return_value = ["Один", None]
+    result = _run_job(blocks, cache=cache)
+    assert result[0].translated == "Один"
+    assert result[1].translated == "Two"  # fallback на оригинал
+    assert cache.get("One", "ru", "auto", "google") == "Один"
+    assert cache.get("Two", "ru", "auto", "google") is None
+
+
+def test_cache_key_separates_providers():
+    """Смена провайдера Google→DeepL не должна отдавать чужие переводы."""
+    cache = TranslationCache(max_size=10, ttl_seconds=3600)
+    cache.put("Hello", "ru", "Привет (google)", "auto", "google")
+    assert cache.get("Hello", "ru", "auto", "deepl") is None
+    assert cache.get("Hello", "ru", "auto", "google") == "Привет (google)"
+
+
+@patch("core.translator.TranslationJobThread._google_one")
+def test_parallel_translate_preserves_order(mock_one):
+    """PERF-004: параллельный перевод обязан сохранять порядок блоков."""
+    mock_one.side_effect = lambda text: f"<{text}>"
+    job = TranslationJobThread(
+        blocks=[], target_lang="ru", source_lang="auto",
+        provider="google", deepl_api_key="",
+        cache=TranslationCache(max_size=10, ttl_seconds=3600),
+    )
+    texts = [f"line {i}" for i in range(10)]
+    assert job._translate_google(texts) == [f"<line {i}>" for i in range(10)]

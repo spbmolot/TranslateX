@@ -4,6 +4,27 @@
 > + снижение нагрузки на CPU/RAM.
 > **GPU-задачи отложены** до появления CUDA в окружении.
 
+## Статус (обновлено 2026-07-06)
+
+| Задача | Статус | Примечание |
+|---|---|---|
+| PERF-001 бенчмарк-харнесс | ✅ сделано | `pytest -m perf`, `scripts/run_bench.py --baseline/--compare`; baseline в `tests/benchmark/baseline.json` |
+| PERF-002 downsample перед OCR | ✅ сделано | `core/ocr.py: preprocess_for_ocr` — auto (>720p → 720p, клэмп ×0.5) / off / фикс. коэффициент; bbox масштабируются обратно; настройка в UI |
+| PERF-004 async-batch translation | ✅ сделано | `ThreadPoolExecutor(4)` в `_translate_google`; порядок сохраняется; фейл одного блока не роняет остальные |
+| PERF-011 keep-alive Session | ✅ сделано | Подмена модульного `requests` в `deep_translator.google` на `Session` с connection pooling |
+| PERF-013 захват без скрытия overlay | ✅ сделано (иначе) | Вместо DXGI — `WDA_EXCLUDEFROMCAPTURE` (Win10 2004+): overlay исключён из BitBlt/mss-захвата, мерцание убрано. Эмпирическая проверка: `scripts/check_capture_exclusion.py`. Fallback hide/show сохранён |
+| PERF-008 CPU-only torch | ✅ уже так | В окружении `torch 2.10.0+cpu`, CUDA-DLL в dist нет. Dist 1.09 ГБ — это вес самого torch CPU + PyQt5 + cv2 + scipy. Дальнейшее похудение — только через PERF-006 (ONNX, убирает torch целиком) |
+| PERF-003 lazy-load OCR | ⬜ не начато | |
+| PERF-005 incremental repaint | ⬜ не начато | |
+| PERF-006 ONNX + INT8 | ⬜ не начато | Следующий крупный шаг, см. план в карточке ниже |
+| PERF-007 detector-skip | ⬜ не начато | |
+| PERF-009/010/012 | ⬜ не начато | |
+
+Кроме perf: сделаны группировка строк в абзацы (`core/paragraphs.py`),
+inpaint-подложка (`core/inpaint.py` + `ui/overlay.py`), фиксы кэша
+переводов (не кэшировать фейлы; ключ с provider/source), тайловый
+frame-diff (`_frame_unchanged`), честный режим `auto` для исходного языка.
+
 ## Легенда
 
 - **Owner**: основной агент-исполнитель (см. `.windsurf/rules/`).
@@ -127,6 +148,20 @@
 - **Owner**: `ocr-translate-engineer` + `packaging-engineer` (build.spec)
 - **Tier**: 2
 - **Cost**: 2–3 дня
+- **План выполнения (уточнён 2026-07-06):**
+  1. `pip install onnxruntime` (только dev; в requirements — после проверки recall).
+  2. `scripts/export_onnx.py`: загрузить CRAFT (`craft_mlt_25k.pth`) и
+     `cyrillic_g2.pth` через easyocr-классы → `torch.onnx.export`
+     (dynamic axes по H/W и длине последовательности) →
+     `onnxruntime.quantization.quantize_dynamic` (INT8).
+  3. `core/ocr_backends/onnx_backend.py`: препроцессинг как в EasyOCR
+     (resize_aspect_ratio + normalizeMeanVariance), постпроцессинг
+     `getDetBoxes` можно импортировать из `easyocr.craft_utils` (лёгкий, без torch).
+  4. Валидация: `pytest -m perf` + фикстуры `make_text_image` — recall ≥90%
+     от EasyOCR baseline (`tests/benchmark/baseline.json` уже содержит
+     `ocr_readtext_720p_*` для сравнения).
+  5. Только после этого: выкинуть torch из build.spec → dist ~1.09 ГБ → ~350-450 МБ,
+     исчезает весь DLL-хак `_prepare_torch_dll_paths` в main.py.
 - **Эффект (ожид.)**: ×2–4 на CPU; RAM −400 МБ (нет full torch).
 - **Files**:
   - `core/ocr.py`: новый backend `OnnxOcrEngine` (alternative to EasyOCR Reader)

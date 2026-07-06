@@ -58,11 +58,52 @@ def ensure_bundled_models() -> None:
         logger.warning(f"Could not pre-install bundled OCR models: {e}")
 
 
+def preprocess_for_ocr(image: np.ndarray, mode: str = "auto"):
+    """
+    PERF-002: даунсэмпл кадра перед EasyOCR. CRAFT-детектор масштабируется
+    ~квадратично по площади: сжатие 1440p → 720p даёт ×2-4 на CPU.
+
+    mode:
+      "off"   — без изменений;
+      "auto"  — если высота > 720px, сжать до 720px, но не сильнее чем ×0.5
+                (консервативно: мелкий шрифт при более агрессивном сжатии
+                перестаёт распознаваться);
+      "<0..1>" — явный фиксированный коэффициент (например "0.5").
+
+    Возвращает (processed_image, scale). bbox'ы результата OCR нужно
+    умножить на 1/scale, чтобы вернуть их в координаты исходного кадра.
+    """
+    mode = (mode or "auto").strip().lower()
+    if mode == "off":
+        return image, 1.0
+    h, w = image.shape[:2]
+    if mode == "auto":
+        target = 720
+        if h <= target:
+            return image, 1.0
+        scale = max(target / h, 0.5)
+    else:
+        try:
+            scale = float(mode)
+        except (TypeError, ValueError):
+            return image, 1.0
+        if not (0.1 <= scale < 1.0):
+            return image, 1.0
+    import cv2
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    return resized, scale
+
+
 @dataclass
 class TextBlock:
     text: str
     bbox: List[List[int]]  # 4 corner points [[x1,y1],[x2,y1],[x2,y2],[x1,y2]]
     confidence: float
+    # Медианный цвет фона вокруг bbox (r, g, b) — для inpaint-подложки
+    # overlay. Проставляется core.inpaint.apply_bg_colors после OCR.
+    bg_rgb: Optional[Tuple[int, int, int]] = None
 
 
 class OcrWorker(QThread):
@@ -81,12 +122,9 @@ class OcrWorker(QThread):
         self._min_confidence = min_confidence
         self._use_gpu = use_gpu
         self._reader = None
-        self._pending: Optional[np.ndarray] = None
-        self._running = False
 
     def run(self) -> None:
         """Initialize EasyOCR (blocking) then enter idle loop."""
-        self._running = True
         try:
             import easyocr
             # Скопировать вшитые модели в ~/.EasyOCR/model, чтобы первый запуск
@@ -112,40 +150,7 @@ class OcrWorker(QThread):
         # впустую. quit() из stop() корректно завершает exec_().
         self.exec_()
 
-    def process(self, image: np.ndarray) -> None:
-        """
-        Submit an image for OCR processing.
-        Called from the main thread; runs OCR synchronously on this worker thread.
-        If a previous job is still running, the new image replaces the pending slot.
-        """
-        if self._reader is None:
-            return
-        self._pending = image
-        if not self.isRunning():
-            return
-        # Run immediately on this thread via invokeMethod would require moving logic here.
-        # Instead we use a simple approach: run in a separate one-shot thread.
-        self._run_ocr(image)
-
-    def _run_ocr(self, image: np.ndarray) -> None:
-        """Execute OCR and emit results. Called from worker thread."""
-        if self._reader is None:
-            return
-        try:
-            results = self._reader.readtext(image, detail=1, paragraph=False)
-            blocks = []
-            for bbox, text, conf in results:
-                text = text.strip()
-                if not text or conf < self._min_confidence:
-                    continue
-                blocks.append(TextBlock(text=text, bbox=bbox, confidence=conf))
-            self.ocr_complete.emit(blocks)
-        except Exception as e:
-            logger.error(f"OCR error: {e}")
-            self.ocr_complete.emit([])
-
     def stop(self) -> None:
-        self._running = False
         self.quit()
         self.wait(3000)
 
@@ -158,22 +163,31 @@ class OcrJobThread(QThread):
     ocr_complete = pyqtSignal(object)
     error = pyqtSignal(str)
 
-    def __init__(self, reader, image: np.ndarray, min_confidence: float, parent=None):
+    def __init__(self, reader, image: np.ndarray, min_confidence: float,
+                 downscale: str = "auto", parent=None):
         super().__init__(parent)
         self._reader = reader
         self._image = image
         self._min_confidence = min_confidence
+        self._downscale = downscale
 
     def run(self) -> None:
         try:
-            results = self._reader.readtext(self._image, detail=1, paragraph=False)
+            # PERF-002: сжимаем кадр перед детектором, bbox'ы возвращаем
+            # в координатах ИСХОДНОГО кадра (умножаем на 1/scale).
+            image, scale = preprocess_for_ocr(self._image, self._downscale)
+            inv = 1.0 / scale
+            results = self._reader.readtext(image, detail=1, paragraph=False)
             blocks = []
             for bbox, text, conf in results:
                 text = text.strip()
                 if not text or conf < self._min_confidence:
                     continue
                 # Convert EasyOCR bbox format to list of int lists
-                int_bbox = [[int(p[0]), int(p[1])] for p in bbox]
+                int_bbox = [
+                    [int(round(p[0] * inv)), int(round(p[1] * inv))]
+                    for p in bbox
+                ]
                 blocks.append(TextBlock(text=text, bbox=int_bbox, confidence=float(conf)))
             self.ocr_complete.emit(blocks)
         except Exception as e:
