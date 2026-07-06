@@ -16,8 +16,9 @@ from core.translator import TranslatedBlock  # noqa: E402
 from ui.overlay import TranslationOverlay    # noqa: E402
 
 
-def _make_overlay(style: str) -> TranslationOverlay:
-    ov = TranslationOverlay()
+def _make_overlay(style: str, opaque: bool = True) -> TranslationOverlay:
+    # Продовое соответствие: inpaint → opaque+mask, outline → translucent
+    ov = TranslationOverlay(opaque_mode=opaque)
     ov.resize(400, 200)
     ov.apply_config(
         opacity=0.0, font_size=13, font_color="#ffffff",
@@ -73,9 +74,9 @@ def test_inpaint_draws_contrast_text():
     assert light > 10, "белые пиксели текста не найдены внутри bbox"
 
 
-def test_block_without_bg_falls_back_to_outline():
-    """Блок без bg_rgb не должен заливаться, даже в режиме inpaint."""
-    ov = _make_overlay("inpaint")
+def test_block_without_bg_translucent_falls_back_to_outline():
+    """Translucent-режим: блок без bg_rgb не заливается (текст с обводкой)."""
+    ov = _make_overlay("inpaint", opaque=False)
     ov._blocks = [_block(None)]
     ov._region = QRect(0, 0, 400, 200)
     img = _render(ov)
@@ -84,8 +85,21 @@ def test_block_without_bg_falls_back_to_outline():
     assert c.alpha() < 40, f"ожидалась прозрачность, alpha={c.alpha()}"
 
 
+def test_block_without_bg_opaque_draws_solid_plate():
+    """Opaque-режим: окно не умеет полупрозрачность — блок без bg_rgb
+    получает плотную плашку цветом bg_color (#1a1a2e)."""
+    ov = _make_overlay("inpaint", opaque=True)
+    ov._blocks = [_block(None)]
+    ov._region = QRect(0, 0, 400, 200)
+    img = _render(ov)
+    c = img.pixelColor(374, 24)
+    assert c.alpha() > 200
+    assert c.red() < 60 and c.blue() < 80, \
+        f"ожидалась тёмная плашка, RGB({c.red()},{c.green()},{c.blue()})"
+
+
 def test_outline_style_ignores_bg_rgb():
-    ov = _make_overlay("outline")
+    ov = _make_overlay("outline", opaque=False)
     ov._blocks = [_block((200, 30, 30))]
     ov._region = QRect(0, 0, 400, 200)
     img = _render(ov)
@@ -93,3 +107,15 @@ def test_outline_style_ignores_bg_rgb():
     # outline + opacity 0 → без красной заливки
     assert not (abs(c.red() - 200) <= 40 and c.green() <= 80), \
         "outline-режим не должен рисовать inpaint-заливку"
+
+
+def test_opaque_mode_sets_window_mask():
+    """Opaque-режим: форма окна = объединение bbox'ов (вне маски окно
+    не существует — контент виден, клики проходят)."""
+    ov = _make_overlay("inpaint", opaque=True)
+    ov.update_blocks([_block((10, 10, 10))], QRect(0, 0, 400, 200))
+    mask = ov.mask()
+    assert not mask.isEmpty()
+    br = mask.boundingRect()
+    assert (br.x(), br.y(), br.width(), br.height()) == (20, 20, 360, 40)
+    ov.hide_overlay()

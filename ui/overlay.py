@@ -1,13 +1,20 @@
 """
-TranslationOverlay — прозрачный, click-through, always-on-top слой.
-Рисует переведённый текст поверх захваченной области.
-Поддерживает авто-масштабирование шрифта под DPI Windows.
+TranslationOverlay — click-through, always-on-top слой с переводом.
+
+Два режима окна (выбирается при создании):
+  opaque_mode=True (дефолт, для style=inpaint): окно НЕпрозрачное, его
+    форма ограничена маской из bbox'ов блоков (setMask). Такое окно
+    совместимо с WDA_EXCLUDEFROMCAPTURE → его не нужно прятать перед
+    каждым захватом кадра, перевод не мерцает.
+  opaque_mode=False (для style=outline): классический per-pixel
+    прозрачный слой (WA_TranslucentBackground). WDA для таких окон не
+    работает (UpdateLayeredWindow) — используется hide/show fallback.
 """
 import logging
 from typing import List
 
 from PyQt5.QtCore import QEasingCurve, QPropertyAnimation, QRect, Qt, pyqtSlot
-from PyQt5.QtGui import QColor, QFont, QPainter, QPen, QBrush, QFontMetrics
+from PyQt5.QtGui import QColor, QFont, QPainter, QPen, QBrush, QFontMetrics, QRegion
 from PyQt5.QtWidgets import QWidget
 
 from core.translator import TranslatedBlock
@@ -20,7 +27,7 @@ _PADDING = 5  # px around text
 
 
 class TranslationOverlay(QWidget):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, opaque_mode: bool = True):
         super().__init__(parent)
         self._blocks: List[TranslatedBlock] = []
         self._region: QRect = QRect()
@@ -31,9 +38,9 @@ class TranslationOverlay(QWidget):
         self._bg_color = QColor("#1a1a2e")
         self._style = "inpaint"
         self._visible = False
-        # WDA_EXCLUDEFROMCAPTURE: окно исключено из захвата экрана — overlay
-        # не нужно прятать перед каждым кадром (убирает мерцание ~1.5с).
-        # Проверено эмпирически с mss/BitBlt (scripts/check_capture_exclusion.py).
+        # См. докстринг модуля: opaque+mask совместим с WDA-исключением
+        # из захвата, translucent — нет (для него hide/show fallback).
+        self._opaque_mode = opaque_mode
         self._exclude_from_capture = True   # желаемый режим (из конфига)
         self._capture_excluded = False      # фактически применено к HWND
         # PERF-005: сигнатура последних отрисованных блоков — если контент
@@ -47,7 +54,10 @@ class TranslationOverlay(QWidget):
             Qt.Tool |
             Qt.WindowTransparentForInput
         )
-        self.setAttribute(Qt.WA_TranslucentBackground)
+        if not opaque_mode:
+            # Per-pixel alpha. ВАЖНО: атрибут можно ставить только до
+            # создания HWND; смена режима = пересоздание overlay (App).
+            self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setWindowOpacity(1.0)
 
@@ -69,8 +79,13 @@ class TranslationOverlay(QWidget):
     def _apply_capture_exclusion(self) -> None:
         """Применяет/снимает исключение окна из захвата по _exclude_from_capture.
         При успехе hide_overlay_for_capture/restore_after_capture становятся
-        no-op — overlay не мерцает. При неуспехе (старая Windows, нет DWM)
-        остаётся прежний hide/show fallback."""
+        no-op — overlay не мерцает. При неуспехе (старая Windows, нет DWM,
+        translucent-режим) остаётся прежний hide/show fallback."""
+        if not self._opaque_mode:
+            # WDA не работает для WA_TranslucentBackground-окон
+            # (UpdateLayeredWindow) — API вернёт False, не тратим вызов.
+            self._capture_excluded = False
+            return
         try:
             hwnd = win32_utils.get_hwnd(self)
             if self._exclude_from_capture and not self._capture_excluded:
@@ -165,6 +180,19 @@ class TranslationOverlay(QWidget):
             ),
         )
 
+    def _blocks_mask(self) -> QRegion:
+        """Форма окна в opaque-режиме: объединение bbox'ов блоков.
+        Всё вне маски физически не принадлежит окну — контент под
+        переводом виден как обычно, клики проходят насквозь."""
+        mask = QRegion()
+        for b in self._blocks:
+            bx, by, bw, bh = geometry.easyocr_bbox_to_rect(b.bbox)
+            bx, by, bw, bh = geometry.clamp_rect(
+                bx, by, bw, bh, self.width(), self.height())
+            if bw > 4 and bh > 4:
+                mask += QRegion(bx, by, bw, bh)
+        return mask
+
     def update_blocks(self, blocks: List[TranslatedBlock], region: QRect) -> None:
         sig = self._blocks_signature(blocks, region)
         unchanged = sig == self._last_blocks_sig
@@ -177,6 +205,8 @@ class TranslationOverlay(QWidget):
             # прячем overlay, чтобы не было пустого окна и старых надписей.
             self.hide_overlay()
             return
+        if self._opaque_mode and not unchanged:
+            self.setMask(self._blocks_mask())
         if not self._visible:
             self.show_overlay()
             self.update()
@@ -308,9 +338,17 @@ class TranslationOverlay(QWidget):
                 )
                 continue
 
-            # Fallback-стиль 'outline' (или блок без bg_rgb):
-            # полупрозрачная подложка (если включена настройками)
-            if has_bg:
+            # Fallback-стиль 'outline' (или блок без bg_rgb).
+            # В opaque-режиме окно не умеет полупрозрачность — рисуем
+            # плотную плашку цветом bg_color, иначе текст лёг бы на
+            # неинициализированный фон окна.
+            if self._opaque_mode:
+                solid = QColor(self._bg_color)
+                solid.setAlpha(255)
+                painter.setBrush(QBrush(solid))
+                painter.setPen(Qt.NoPen)
+                painter.drawRoundedRect(bx, by, bw, bh, 3, 3)
+            elif has_bg:
                 painter.setBrush(QBrush(bg))
                 painter.setPen(Qt.NoPen)
                 painter.drawRoundedRect(bx, by, bw, bh, 3, 3)

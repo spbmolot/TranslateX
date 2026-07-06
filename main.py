@@ -232,7 +232,11 @@ class App(QObject):
 
         # Компоненты
         self._controller = AppController(config)
-        self._overlay = TranslationOverlay()
+        # Режим окна overlay зависит от стиля: inpaint → opaque+mask
+        # (совместим с WDA-исключением из захвата, перевод не мерцает);
+        # outline → translucent (hide/show fallback). Смена стиля в
+        # настройках пересоздаёт overlay (_recreate_overlay_if_needed).
+        self._overlay = TranslationOverlay(opaque_mode=self._overlay_opaque_mode(config))
         self._selector = RegionSelector()
         self._frame = RegionFrame()
         self._history = HistoryPanel()
@@ -251,8 +255,7 @@ class App(QObject):
         self._controller.ocr_loading.connect(self._tray.set_ocr_loading)
         self._controller.status_message.connect(self._tray.set_status)
         # Overlay не должен попадать в кадр захвата
-        self._controller.capture_about_to_start.connect(self._overlay.hide_overlay_for_capture)
-        self._controller.capture_finished.connect(self._overlay.restore_after_capture)
+        self._wire_overlay(self._overlay)
         # Счётчики в тулбаре фрейма
         self._controller.ocr_progress.connect(self._frame.on_capture_done)
         self._controller.translation_progress.connect(self._frame.on_translation_done)
@@ -293,6 +296,34 @@ class App(QObject):
         QTimer.singleShot(500, self._register_hotkeys)
         # Показываем рамку захвата сразу при запуске (Bandicam-style)
         QTimer.singleShot(100, self._show_default_frame)
+
+    # ── Overlay: режим окна и пересоздание ────────────────────────────
+
+    @staticmethod
+    def _overlay_opaque_mode(config: configparser.ConfigParser) -> bool:
+        return config.get("overlay", "style", fallback="inpaint") == "inpaint"
+
+    def _wire_overlay(self, overlay: TranslationOverlay) -> None:
+        self._controller.capture_about_to_start.connect(overlay.hide_overlay_for_capture)
+        self._controller.capture_finished.connect(overlay.restore_after_capture)
+
+    def _recreate_overlay_if_needed(self) -> None:
+        """WA_TranslucentBackground нельзя переключить у живого окна —
+        при смене режима (inpaint↔outline) overlay пересоздаётся."""
+        want_opaque = self._overlay_opaque_mode(self._config)
+        if want_opaque == self._overlay._opaque_mode:
+            return
+        old = self._overlay
+        try:
+            self._controller.capture_about_to_start.disconnect(old.hide_overlay_for_capture)
+            self._controller.capture_finished.disconnect(old.restore_after_capture)
+        except TypeError:
+            pass
+        old.hide_overlay()
+        old.deleteLater()
+        self._overlay = TranslationOverlay(opaque_mode=want_opaque)
+        self._wire_overlay(self._overlay)
+        logger.info(f"Overlay пересоздан: opaque_mode={want_opaque}")
 
     # ── Горячие клавиши ──────────────────────────────────────────────
 
@@ -488,6 +519,7 @@ class App(QObject):
     def _on_settings_saved(self, config: configparser.ConfigParser) -> None:
         self._config = config
         self._controller.reload_config(config)
+        self._recreate_overlay_if_needed()
         # U3: реаплай темы (вдруг пользователь переключил light↔dark в Настройках).
         apply_theme(self._qapp, config.get("ui", "theme", fallback="auto"))
         # Перекрасить кастомную рамку (тулбар/бордюр рисуются вручную, не через QSS).

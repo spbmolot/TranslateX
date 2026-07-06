@@ -45,10 +45,14 @@ def set_exclude_from_capture(hwnd: int) -> bool:
 
     Требует Windows 10 2004+ и НЕ работает без DWM-композиции.
     Возвращает True при успехе; False → вызывающий код должен использовать
-    fallback hide/show. Обязательно проверяйте эмпирически (см.
-    scripts/check_capture_exclusion.py) — на некоторых конфигурациях
-    (RDP-сессии, отключённый DWM) API возвращает успех, но окно всё равно
-    попадает в кадр.
+    fallback hide/show.
+
+    ВАЖНО (проверено эмпирически, scripts/check_capture_exclusion.py):
+    - обычные окна и окна с WS_EX_LAYERED|WS_EX_TRANSPARENT (click-through
+      через SetWindowLong) — РАБОТАЕТ, в т.ч. с setMask;
+    - окна с Qt WA_TranslucentBackground (per-pixel alpha через
+      UpdateLayeredWindow) — API возвращает False, окно остаётся в захвате.
+      Поэтому overlay в inpaint-режиме создаётся НЕпрозрачным с маской.
     """
     try:
         result = _user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
