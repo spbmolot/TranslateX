@@ -23,6 +23,7 @@ def _make_config(overrides: dict[str, dict[str, str]] | None = None) -> configpa
             "hotkey_toggle": "ctrl+shift+p",
             "hotkey_pause":  "ctrl+shift+space",
             "hotkey_copy":   "ctrl+shift+c",
+            "hotkey_fullscreen": "ctrl+shift+f",
             "capture_interval_ms": "1500",
             "cache_ttl_seconds":   "3600",
             "cache_max_size":      "500",

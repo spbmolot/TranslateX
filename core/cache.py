@@ -17,11 +17,15 @@ logger = logging.getLogger(__name__)
 _CACHE_FILE = cache_path()
 
 
-def _normalize(text: str) -> str:
-    """Normalize text for cache key stability across minor OCR variation."""
+def normalize_text(text: str) -> str:
+    """Normalize text for cache key stability across minor OCR variation.
+    Используется и pipeline-ом для дедуп-сигнатуры OCR-кадров."""
     text = text.strip().lower()
     text = re.sub(r"\s+", " ", text)
     return text
+
+
+_normalize = normalize_text  # обратная совместимость внутри модуля
 
 
 class TranslationCache:

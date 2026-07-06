@@ -159,6 +159,8 @@ def validate_and_fix(config: configparser.ConfigParser) -> List[str]:
                issues, pattern=_HOTKEY_RE, label="Горячая клавиша 'Пауза'")
     _check_str(config, "general", "hotkey_copy", "ctrl+shift+c",
                issues, pattern=_HOTKEY_RE, label="Горячая клавиша 'Копировать'")
+    _check_str(config, "general", "hotkey_fullscreen", "ctrl+shift+f",
+               issues, pattern=_HOTKEY_RE, label="Горячая клавиша 'Весь экран'")
     _check_int(config, "general", "capture_interval_ms", 1500, 100, 10000, issues)
     _check_int(config, "general", "cache_ttl_seconds",  3600, 0, 86400 * 30, issues)
     _check_int(config, "general", "cache_max_size",     500, 1, 100000, issues)

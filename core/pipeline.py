@@ -12,7 +12,7 @@ import numpy as np
 from PyQt5.QtCore import QObject, QRect, Qt, QTimer, pyqtSignal, pyqtSlot
 from PyQt5.QtWidgets import QApplication
 
-from core.cache import TranslationCache
+from core.cache import TranslationCache, normalize_text
 from core.capture import capture_to_numpy
 from core.inpaint import apply_bg_colors
 from core.ocr import OcrWorker, OcrJobThread, TextBlock
@@ -51,6 +51,13 @@ class AppController(QObject):
         self._ocr_busy = False
         self._current_ocr_job: Optional[OcrJobThread] = None
         self._current_trans_job: Optional[TranslationJobThread] = None
+        # PERF-010: capture следующего кадра идёт параллельно с переводом
+        # предыдущего, поэтому translation-джобы могут кратко перекрываться.
+        # Монотонный id отбрасывает результат устаревшего джоба, если более
+        # новый уже успел завершиться (иначе старый перевод перезаписал бы
+        # свежий на overlay).
+        self._trans_job_seq = 0
+        self._last_applied_trans_id = 0
         # Счётчики для логов (меняются в одном потоке)
         self._tick_count = 0
         self._capture_count = 0
@@ -471,7 +478,9 @@ class AppController(QObject):
 
         # Дедуп: если набор распознанных строк не изменился с прошлого раза —
         # просто переотображаем кэшированный перевод, не дёргая API/кэш заново.
-        signature = tuple((b.text or "").strip() for b in blocks)
+        # Сигнатура нормализована (lower + схлоп пробелов, как ключ кэша):
+        # OCR-дрожание регистра/пробелов между кадрами не считается изменением.
+        signature = tuple(normalize_text(b.text or "") for b in blocks)
         if (
             signature == self._last_ocr_signature
             and self._last_translated_blocks is not None
@@ -480,7 +489,21 @@ class AppController(QObject):
                 f"OCR identical to previous frame ({len(blocks)} blocks) — "
                 "skipping translation, reusing cached overlay"
             )
-            # Тихо обновим overlay (на случай если он скрыт после capture)
+            # Текст тот же, но координаты могли сдвинуться (скролл) —
+            # пересобираем блоки с НОВЫМИ bbox/цветами и старыми переводами.
+            # Раньше эмитились блоки со старыми координатами и перевод
+            # «отставал» от прокрученного контента.
+            if len(self._last_translated_blocks) == len(blocks):
+                self._last_translated_blocks = [
+                    TranslatedBlock(
+                        original=b.text,
+                        translated=old.translated,
+                        bbox=b.bbox,
+                        confidence=b.confidence,
+                        bg_rgb=getattr(b, "bg_rgb", None),
+                    )
+                    for b, old in zip(blocks, self._last_translated_blocks)
+                ]
             if self._region is not None:
                 self.translation_ready.emit(self._last_translated_blocks, self._region)
             self._reschedule_tick()
@@ -488,6 +511,7 @@ class AppController(QObject):
         self._last_ocr_signature = signature
 
         self._last_trans_start_ts = time.time()
+        self._trans_job_seq += 1
         job = TranslationJobThread(
             blocks=blocks,
             target_lang=self._config.get("languages", "target_lang", fallback="ru"),
@@ -497,14 +521,35 @@ class AppController(QObject):
             cache=self._cache,
             parent=self,
         )
+        job._job_id = self._trans_job_seq
         job.translation_complete.connect(self._on_translation_complete)
         job.finished.connect(job.deleteLater)
         self._current_trans_job = job
         job.start()
-        logger.debug(f"Translation job started for {n_blocks} block(s)")
+        # PERF-010: не ждём конца перевода — планируем следующий capture
+        # сразу. OCR следующего кадра пойдёт параллельно с HTTP-переводом
+        # текущего (обе стадии в своих потоках), throughput выше.
+        self._reschedule_tick()
+        logger.debug(f"Translation job #{self._trans_job_seq} started for {n_blocks} block(s)")
 
     @pyqtSlot(object)
     def _on_translation_complete(self, translated_blocks: list) -> None:
+        # PERF-010: отбрасываем результат джоба, если результат более НОВОГО
+        # джоба уже применён к overlay (перевод старого всё равно лёг в кэш).
+        # Просто «запущен более новый» — не повод дропать: старый результат
+        # валиден, пока новый не пришёл. sender() is None при прямом вызове
+        # в тестах — считаем актуальным.
+        sender = self.sender()
+        job_id = getattr(sender, "_job_id", None) if sender is not None else None
+        if job_id is not None:
+            if job_id <= self._last_applied_trans_id:
+                logger.debug(
+                    f"Translation job #{job_id} dropped "
+                    f"(overlay already has #{self._last_applied_trans_id})"
+                )
+                self._reschedule_tick()
+                return
+            self._last_applied_trans_id = job_id
         self._trans_count += 1
         elapsed_ms = (time.time() - self._last_trans_start_ts) * 1000
         n = len(translated_blocks) if translated_blocks else 0

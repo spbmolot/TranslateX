@@ -176,6 +176,7 @@ def load_config() -> configparser.ConfigParser:
             "hotkey_toggle": "ctrl+shift+p",
             "hotkey_pause": "ctrl+shift+space",
             "hotkey_copy": "ctrl+shift+c",
+            "hotkey_fullscreen": "ctrl+shift+f",
             "capture_interval_ms": "1500",
             "cache_ttl_seconds": "3600",
             "cache_max_size": "500",
@@ -280,6 +281,7 @@ class App(QObject):
 
         # Сигналы трея
         self._tray.select_region_requested.connect(self._show_selector)
+        self._tray.fullscreen_requested.connect(self._translate_fullscreen)
         self._tray.toggle_requested.connect(self._toggle_translation)
         self._tray.settings_requested.connect(self._show_settings)
         self._tray.quit_requested.connect(self._quit)
@@ -301,15 +303,18 @@ class App(QObject):
             hk_toggle = self._config.get("general", "hotkey_toggle", fallback="ctrl+shift+p")
             hk_pause = self._config.get("general", "hotkey_pause", fallback="ctrl+shift+space")
             hk_copy = self._config.get("general", "hotkey_copy", fallback="ctrl+shift+c")
+            hk_fullscreen = self._config.get(
+                "general", "hotkey_fullscreen", fallback="ctrl+shift+f")
 
             keyboard.add_hotkey(hk_select, lambda: QTimer.singleShot(0, self._show_selector), suppress=False)
             keyboard.add_hotkey(hk_toggle, lambda: QTimer.singleShot(0, self._toggle_translation), suppress=False)
             keyboard.add_hotkey(hk_pause, lambda: QTimer.singleShot(0, self._controller.toggle_pause), suppress=False)
             keyboard.add_hotkey(hk_copy, lambda: QTimer.singleShot(0, self._copy_last_translation), suppress=False)
+            keyboard.add_hotkey(hk_fullscreen, lambda: QTimer.singleShot(0, self._translate_fullscreen), suppress=False)
             self._hotkeys_registered = True
             logger.info(
-                f"Горячие клавиши: {hk_select}, {hk_toggle}, "
-                f"{hk_pause} (pause), {hk_copy} (copy)"
+                f"Горячие клавиши: {hk_select}, {hk_toggle}, {hk_pause} (pause), "
+                f"{hk_copy} (copy), {hk_fullscreen} (fullscreen)"
             )
         except Exception as e:
             logger.warning(f"Не удалось зарегистрировать горячие клавиши: {e}")
@@ -427,6 +432,26 @@ class App(QObject):
                 "overlay", "exclude_from_capture", fallback=True),
         )
         self._overlay.update_blocks(blocks, region)
+
+    # ── Полноэкранный перевод (как «перевести страницу» у Яндекса) ────
+
+    @pyqtSlot()
+    def _translate_fullscreen(self) -> None:
+        """Переводит весь монитор под курсором одним действием — рамка не
+        нужна. Остановка: Ctrl+Shift+P, двойной клик по трею или меню."""
+        from PyQt5.QtGui import QCursor
+        self._stop_translation()
+        self._frame.set_translating(False)
+        self._frame.hide()
+        screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+        geo = screen.geometry()
+        self._controller.set_region(QRect(geo))
+        self._controller.start()
+        self._tray.set_active(True)
+        logger.info(
+            f"Полноэкранный перевод: {geo.width()}×{geo.height()} "
+            f"на экране '{screen.name()}'"
+        )
 
     # ── Копирование перевода (Ctrl+Shift+C) ──────────────────────────
 

@@ -23,6 +23,7 @@ def _make_default_icon(active: bool = False) -> QIcon:
 
 class SystemTray(QObject):
     select_region_requested = pyqtSignal()
+    fullscreen_requested = pyqtSignal()
     toggle_requested = pyqtSignal()
     settings_requested = pyqtSignal()
     quit_requested = pyqtSignal()
@@ -45,6 +46,10 @@ class SystemTray(QObject):
         action_select = QAction("🔲  Выбрать область", menu)
         action_select.triggered.connect(self.select_region_requested)
         menu.addAction(action_select)
+
+        action_fullscreen = QAction("🖥  Перевести весь экран", menu)
+        action_fullscreen.triggered.connect(self.fullscreen_requested)
+        menu.addAction(action_fullscreen)
 
         menu.addSeparator()
 
@@ -79,6 +84,7 @@ class SystemTray(QObject):
             "TranslateX",
             "Приложение работает в трее.\n"
             "Ctrl+Shift+T — выбрать область экрана\n"
+            "Ctrl+Shift+F — перевести весь экран\n"
             "Ctrl+Shift+P — начать/остановить перевод\n"
             "Ctrl+Shift+C — скопировать перевод",
             QSystemTrayIcon.Information,
