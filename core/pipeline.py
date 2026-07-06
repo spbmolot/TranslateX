@@ -9,7 +9,7 @@ import time
 from typing import Optional
 
 import numpy as np
-from PyQt5.QtCore import QObject, QRect, QTimer, pyqtSignal, pyqtSlot
+from PyQt5.QtCore import QObject, QRect, Qt, QTimer, pyqtSignal, pyqtSlot
 from PyQt5.QtWidgets import QApplication
 
 from core.cache import TranslationCache
@@ -27,6 +27,8 @@ class AppController(QObject):
     translation_ready = pyqtSignal(object, QRect)  # list[TranslatedBlock], capture_region
     # Emitted when OCR engine is initialized and ready
     ocr_ready = pyqtSignal()
+    # Emitted when lazy OCR worker starts loading (PERF-003) — UI показывает спиннер
+    ocr_loading = pyqtSignal()
     # Emitted on errors for status display
     status_message = pyqtSignal(str)
     # Emitted right before/after a screen grab — overlay should hide/show accordingly
@@ -77,17 +79,12 @@ class AppController(QObject):
             ttl_seconds=config.getint("general", "cache_ttl_seconds", fallback=3600),
         )
 
-        # OCR worker (persistent thread for Reader initialization)
-        langs = self._ocr_languages()
-        self._ocr_worker = OcrWorker(
-            languages=langs,
-            min_confidence=config.getfloat("overlay", "min_confidence", fallback=0.4),
-            use_gpu=config.getboolean("ocr", "gpu", fallback=False),
-            parent=self,
-        )
-        self._ocr_worker.ready.connect(self._on_ocr_ready)
-        self._ocr_worker.error.connect(self._on_ocr_error)
-        self._ocr_worker.start()
+        # PERF-003: OCR worker создаётся ЛЕНИВО при первом start().
+        # EasyOCR + модели — это секунды загрузки и сотни МБ RAM; пока
+        # пользователь не запустил перевод, они не нужны (быстрый cold start,
+        # лёгкий idle в трее). Примечание: torch всё равно импортируется в
+        # main.py до PyQt5 (DLL-порядок), так что экономия — Reader и модели.
+        self._ocr_worker: Optional[OcrWorker] = None
 
         # Capture timer (single-shot: event-driven reschedule после завершения
         # OCR/translation вместо постоянного тика — экономит CPU и убирает
@@ -95,6 +92,8 @@ class AppController(QObject):
         interval = config.getint("general", "capture_interval_ms", fallback=1500)
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
+        # PERF-012: точный таймер — джиттер тика ±2мс вместо ±20мс у CoarseTimer
+        self._timer.setTimerType(Qt.PreciseTimer)
         self._timer.setInterval(interval)
         self._timer.timeout.connect(self._on_timer_tick)
 
@@ -155,11 +154,31 @@ class AppController(QObject):
         # в секунду — это засоряло бы production-лог сотнями записей.
         logger.debug(f"Capture region set: {region}")
 
+    def _ensure_ocr_worker(self) -> None:
+        """PERF-003: создать и запустить OCR worker при первом обращении."""
+        if self._ocr_worker is not None:
+            return
+        langs = self._ocr_languages()
+        self._ocr_worker = OcrWorker(
+            languages=langs,
+            min_confidence=self._config.getfloat("overlay", "min_confidence", fallback=0.4),
+            use_gpu=self._config.getboolean("ocr", "gpu", fallback=False),
+            parent=self,
+        )
+        self._ocr_worker.ready.connect(self._on_ocr_ready)
+        self._ocr_worker.error.connect(self._on_ocr_error)
+        self._ocr_worker.start()
+        self.ocr_loading.emit()
+        logger.info(f"OCR worker started lazily (langs={langs})")
+
     @pyqtSlot()
     def start(self) -> None:
         if self._region is None:
             self.status_message.emit("Сначала выберите область")
             return
+        # Лениво поднимаем OCR: пока Reader грузится, тики будут
+        # пропускаться со статусом «Загрузка OCR…», затем перевод пойдёт сам.
+        self._ensure_ocr_worker()
         self._active = True
         self._tick_count = 0
         self._capture_count = 0
@@ -312,7 +331,7 @@ class AppController(QObject):
             return
         # _ocr_busy guard не нужен: таймер single-shot останавливается при
         # запуске OCR job'а и перезапускается в _on_ocr_complete / _on_translation_complete.
-        if self._ocr_worker._reader is None:
+        if self._ocr_worker is None or self._ocr_worker._reader is None:
             # Предупреждаем один раз вместо спама
             if not self._warned_not_ready:
                 logger.warning(
@@ -511,6 +530,18 @@ class AppController(QObject):
         # Цикл capture→OCR→translate закрыт — планируем следующий capture.
         self._reschedule_tick()
 
+    def last_translation_text(self) -> str:
+        """Текст последнего перевода (для копирования в буфер обмена):
+        блоки в порядке сверху-вниз, по одному на строку. Пусто, если
+        перевода ещё не было."""
+        blocks = self._last_translated_blocks or []
+        lines = []
+        for b in blocks:
+            t = (b.translated or "").strip()
+            if t:
+                lines.append(t)
+        return "\n".join(lines)
+
     def shutdown(self) -> None:
         """Clean shutdown — save cache, stop workers, wait for in-flight jobs."""
         self._timer.stop()
@@ -522,5 +553,6 @@ class AppController(QObject):
             except RuntimeError:
                 pass  # объект уже удалён Qt-ом
         self._cache.save()
-        self._ocr_worker.stop()
+        if self._ocr_worker is not None:
+            self._ocr_worker.stop()
         logger.info("Pipeline shut down")

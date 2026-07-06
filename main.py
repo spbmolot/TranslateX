@@ -175,6 +175,7 @@ def load_config() -> configparser.ConfigParser:
             "hotkey_select": "ctrl+shift+t",
             "hotkey_toggle": "ctrl+shift+p",
             "hotkey_pause": "ctrl+shift+space",
+            "hotkey_copy": "ctrl+shift+c",
             "capture_interval_ms": "1500",
             "cache_ttl_seconds": "3600",
             "cache_max_size": "500",
@@ -244,6 +245,9 @@ class App(QObject):
         # История переводов: пишет в HistoryPanel при каждом успешном переводе
         self._controller.translation_ready.connect(self._history.add_entries)
         self._controller.ocr_ready.connect(self._on_ocr_ready)
+        # PERF-003: OCR грузится лениво при первом Старте — спиннер по сигналу
+        self._controller.ocr_loading.connect(self._frame.set_ocr_loading)
+        self._controller.ocr_loading.connect(self._tray.set_ocr_loading)
         self._controller.status_message.connect(self._tray.set_status)
         # Overlay не должен попадать в кадр захвата
         self._controller.capture_about_to_start.connect(self._overlay.hide_overlay_for_capture)
@@ -280,7 +284,8 @@ class App(QObject):
         self._tray.settings_requested.connect(self._show_settings)
         self._tray.quit_requested.connect(self._quit)
 
-        self._tray.set_ocr_loading()
+        # PERF-003: OCR не грузится при старте приложения — только при первом
+        # запуске перевода. Трей показывает нейтральное «ожидание».
         self._tray.show()
 
         QTimer.singleShot(500, self._register_hotkeys)
@@ -295,12 +300,17 @@ class App(QObject):
             hk_select = self._config.get("general", "hotkey_select", fallback="ctrl+shift+t")
             hk_toggle = self._config.get("general", "hotkey_toggle", fallback="ctrl+shift+p")
             hk_pause = self._config.get("general", "hotkey_pause", fallback="ctrl+shift+space")
+            hk_copy = self._config.get("general", "hotkey_copy", fallback="ctrl+shift+c")
 
             keyboard.add_hotkey(hk_select, lambda: QTimer.singleShot(0, self._show_selector), suppress=False)
             keyboard.add_hotkey(hk_toggle, lambda: QTimer.singleShot(0, self._toggle_translation), suppress=False)
             keyboard.add_hotkey(hk_pause, lambda: QTimer.singleShot(0, self._controller.toggle_pause), suppress=False)
+            keyboard.add_hotkey(hk_copy, lambda: QTimer.singleShot(0, self._copy_last_translation), suppress=False)
             self._hotkeys_registered = True
-            logger.info(f"Горячие клавиши: {hk_select}, {hk_toggle}, {hk_pause} (pause)")
+            logger.info(
+                f"Горячие клавиши: {hk_select}, {hk_toggle}, "
+                f"{hk_pause} (pause), {hk_copy} (copy)"
+            )
         except Exception as e:
             logger.warning(f"Не удалось зарегистрировать горячие клавиши: {e}")
 
@@ -371,10 +381,9 @@ class App(QObject):
 
     @pyqtSlot()
     def _start_translation(self) -> None:
-        if not self._ocr_ready:
-            self._tray.set_status("OCR ещё загружается, подождите...")
-            self._frame.set_translating(False)
-            return
+        # PERF-003: не блокируем запуск, пока OCR не готов — pipeline сам
+        # лениво поднимет worker, покажет «Загрузка OCR…» и начнёт переводить,
+        # как только Reader догрузится (клик второй раз не нужен).
         region = self._frame.capture_rect()
         self._controller.set_region(region)
         self._controller.start()
@@ -393,8 +402,6 @@ class App(QObject):
 
     @pyqtSlot()
     def _toggle_translation(self) -> None:
-        if not self._ocr_ready:
-            return
         if self._controller._active:
             self._stop_translation()
             self._frame.set_translating(False)
@@ -420,6 +427,22 @@ class App(QObject):
                 "overlay", "exclude_from_capture", fallback=True),
         )
         self._overlay.update_blocks(blocks, region)
+
+    # ── Копирование перевода (Ctrl+Shift+C) ──────────────────────────
+
+    @pyqtSlot()
+    def _copy_last_translation(self) -> None:
+        """Кладёт текст последнего перевода в буфер обмена. Overlay
+        click-through и с него нельзя выделить текст — хоткей решает это."""
+        text = self._controller.last_translation_text()
+        if not text:
+            self._tray.set_status("нет перевода для копирования")
+            return
+        QApplication.clipboard().setText(text)
+        self._tray.set_status("перевод скопирован")
+        if self._frame.isVisible():
+            self._frame.show_toast("Скопировано")
+        logger.info(f"Перевод скопирован в буфер ({len(text)} символов)")
 
     # ── Настройки ────────────────────────────────────────────────────
 

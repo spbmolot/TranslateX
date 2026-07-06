@@ -1,0 +1,50 @@
+{
+  "date": "2026-07-06",
+  "python": "3.12.10",
+  "platform": "Windows-2022Server-10.0.20348-SP0",
+  "results": {
+    "capture_640x220": {
+      "median_ms": 1.365,
+      "p95_ms": 2.645,
+      "n": 50
+    },
+    "frame_diff_1080p": {
+      "median_ms": 19.53,
+      "p95_ms": 25.745,
+      "n": 200
+    },
+    "paragraph_grouping_60": {
+      "median_ms": 2.925,
+      "p95_ms": 3.997,
+      "n": 200
+    },
+    "inpaint_sampling_20": {
+      "median_ms": 1.905,
+      "p95_ms": 3.503,
+      "n": 100
+    },
+    "ocr_preprocess_1440p": {
+      "median_ms": 3.103,
+      "p95_ms": 5.328,
+      "n": 100
+    },
+    "translation_cache_hit_15": {
+      "median_ms": 0.18,
+      "p95_ms": 0.454,
+      "n": 100
+    },
+    "ram_rss": {
+      "rss_mb": 211.8
+    },
+    "ocr_readtext_1440p_auto": {
+      "median_ms": 32315.034,
+      "p95_ms": 37429.127,
+      "n": 5
+    },
+    "ocr_readtext_1440p_off": {
+      "median_ms": 69227.095,
+      "p95_ms": 72554.18,
+      "n": 5
+    }
+  }
+}

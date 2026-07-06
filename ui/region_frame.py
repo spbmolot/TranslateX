@@ -51,7 +51,9 @@ class RegionFrame(QWidget):
         self._ocr_blocks_last = 0
         self._translations = 0
         self._pulse_phase = 0
-        self._ocr_loading = True   # пока OCR-движок не готов — показываем индикатор
+        # PERF-003: OCR грузится лениво при первом Старте, поэтому индикатор
+        # выключен до сигнала AppController.ocr_loading → set_ocr_loading().
+        self._ocr_loading = False
         self._paused = False       # для пульсации/тоста
 
         self.setWindowFlags(
@@ -92,12 +94,12 @@ class RegionFrame(QWidget):
         self._toast_timer.setInterval(1100)
         self._toast_timer.timeout.connect(self._toast.hide)
 
-        # Спиннер загрузки OCR (#11): фаза анимации точек.
+        # Спиннер загрузки OCR (#11): фаза анимации точек. Запускается
+        # только из set_ocr_loading() — при lazy-load OCR ещё не грузится.
         self._spinner_phase = 0
         self._spinner_timer = QTimer(self)
         self._spinner_timer.setInterval(250)
         self._spinner_timer.timeout.connect(self._on_spinner_tick)
-        self._spinner_timer.start()  # стартуем сразу: при показе рамки OCR ещё грузится
 
     # ── Стили (зависят от темы) ────────────────────────────────────────
     @staticmethod
@@ -153,11 +155,12 @@ class RegionFrame(QWidget):
         self._size_label.setStyleSheet("background: transparent;")
         layout.addWidget(self._size_label)
 
-        # Индикатор загрузки OCR (#11)
+        # Индикатор загрузки OCR (#11) — скрыт, пока загрузка не началась
         self._ocr_label = QLabel("загрузка OCR", self._toolbar)
         self._ocr_label.setStyleSheet(
             "color: #ffcc66; font-size: 11px; background: transparent;"
         )
+        self._ocr_label.setVisible(False)
         layout.addWidget(self._ocr_label)
 
         layout.addStretch()
@@ -330,8 +333,12 @@ class RegionFrame(QWidget):
         self._ocr_label.setText(f"загрузка OCR{dots}")
 
     # ── Тост по центру рамки (#10) ─────────────────────────────────────────
+    def show_toast(self, text: str) -> None:
+        """Публичный API: показать тост по центру рамки (например «Скопировано»)."""
+        self._show_toast(text)
+
     def _show_toast(self, text: str) -> None:
-        icon = {"Пауза": "⏸", "Работает": "▶"}.get(text, "")
+        icon = {"Пауза": "⏸", "Работает": "▶", "Скопировано": "📋"}.get(text, "")
         self._toast.setText(f"{icon}  {text}".strip())
         self._toast.adjustSize()
         self._reposition_toast()

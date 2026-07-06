@@ -14,11 +14,17 @@
 | PERF-011 keep-alive Session | ✅ сделано | Подмена модульного `requests` в `deep_translator.google` на `Session` с connection pooling |
 | PERF-013 захват без скрытия overlay | ✅ сделано (иначе) | Вместо DXGI — `WDA_EXCLUDEFROMCAPTURE` (Win10 2004+): overlay исключён из BitBlt/mss-захвата, мерцание убрано. Эмпирическая проверка: `scripts/check_capture_exclusion.py`. Fallback hide/show сохранён |
 | PERF-008 CPU-only torch | ✅ уже так | В окружении `torch 2.10.0+cpu`, CUDA-DLL в dist нет. Dist 1.09 ГБ — это вес самого torch CPU + PyQt5 + cv2 + scipy. Дальнейшее похудение — только через PERF-006 (ONNX, убирает torch целиком) |
-| PERF-003 lazy-load OCR | ⬜ не начато | |
-| PERF-005 incremental repaint | ⬜ не начато | |
+| PERF-003 lazy-load OCR | ✅ сделано | Worker создаётся при первом start(); клик «Старт» не блокируется — pipeline ждёт Reader и стартует сам. Примечание: torch импортируется в main.py до PyQt5 (DLL-порядок), экономится Reader+модели, не сам torch |
+| PERF-005 incremental repaint | ✅ сделано | `update_blocks` пропускает repaint при неизменной сигнатуре (текст+bbox+цвет+регион); на статичном экране 0 перерисовок |
+| PERF-012 PreciseTimer | ✅ сделано | `pipeline.py`: `setTimerType(Qt.PreciseTimer)` |
 | PERF-006 ONNX + INT8 | ⬜ не начато | Следующий крупный шаг, см. план в карточке ниже |
 | PERF-007 detector-skip | ⬜ не начато | |
-| PERF-009/010/012 | ⬜ не начато | |
+| PERF-009 adaptive threshold | ❌ отклонено | Конфликтует с фиксом frame-diff: авто-повышение порога по EMA заново вводит риск «не заметили локальное изменение» (устаревший перевод), ради экономии OCR на видео-сценах, где и так работает resync-кэп 30 скипов. Не делаем, пока нет реальных жалоб на CPU при видео |
+| PERF-010 pipelining | ⬜ не начато | |
+
+**Бенчмарк-подтверждение PERF-002** (VM-baseline 2026-07-06):
+EasyOCR readtext 1440p: downscale=auto **32.3 c** vs off **69.2 c** → **×2.14**
+(машина медленная, важна пропорция; DoD ≥40% выполнен).
 
 Кроме perf: сделаны группировка строк в абзацы (`core/paragraphs.py`),
 inpaint-подложка (`core/inpaint.py` + `ui/overlay.py`), фиксы кэша

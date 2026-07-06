@@ -36,6 +36,10 @@ class TranslationOverlay(QWidget):
         # Проверено эмпирически с mss/BitBlt (scripts/check_capture_exclusion.py).
         self._exclude_from_capture = True   # желаемый режим (из конфига)
         self._capture_excluded = False      # фактически применено к HWND
+        # PERF-005: сигнатура последних отрисованных блоков — если контент
+        # не изменился, repaint пропускается (pipeline ре-эмитит кэшированные
+        # блоки каждый тик на статичном экране).
+        self._last_blocks_sig = None
 
         self.setWindowFlags(
             Qt.FramelessWindowHint |
@@ -147,7 +151,24 @@ class TranslationOverlay(QWidget):
             self.show()
             self._apply_click_through()
 
+    @staticmethod
+    def _blocks_signature(blocks: List[TranslatedBlock], region: QRect):
+        return (
+            (region.x(), region.y(), region.width(), region.height()),
+            tuple(
+                (
+                    b.translated,
+                    tuple(tuple(p) for p in b.bbox),
+                    getattr(b, "bg_rgb", None),
+                )
+                for b in blocks
+            ),
+        )
+
     def update_blocks(self, blocks: List[TranslatedBlock], region: QRect) -> None:
+        sig = self._blocks_signature(blocks, region)
+        unchanged = sig == self._last_blocks_sig
+        self._last_blocks_sig = sig
         self._blocks = blocks
         self._region = region
         self.setGeometry(region)
@@ -158,7 +179,12 @@ class TranslationOverlay(QWidget):
             return
         if not self._visible:
             self.show_overlay()
-        self.update()
+            self.update()
+            return
+        # PERF-005: контент и геометрия не изменились, окно уже видно —
+        # repaint не нужен (экономит font-fitting и растеризацию каждый тик).
+        if not unchanged:
+            self.update()
 
     def apply_config(self, opacity: float, font_size: int,
                      font_color: str, bg_color: str,

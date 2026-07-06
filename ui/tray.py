@@ -79,7 +79,8 @@ class SystemTray(QObject):
             "TranslateX",
             "Приложение работает в трее.\n"
             "Ctrl+Shift+T — выбрать область экрана\n"
-            "Ctrl+Shift+P — начать/остановить перевод",
+            "Ctrl+Shift+P — начать/остановить перевод\n"
+            "Ctrl+Shift+C — скопировать перевод",
             QSystemTrayIcon.Information,
             4000,
         )

@@ -81,6 +81,10 @@ class SettingsDialog(QDialog):
         self._hk_toggle.setPlaceholderText("напр. ctrl+shift+p")
         form.addRow("Горячая клавиша — вкл/выкл перевод:", self._hk_toggle)
 
+        self._hk_copy = QLineEdit()
+        self._hk_copy.setPlaceholderText("напр. ctrl+shift+c")
+        form.addRow("Горячая клавиша — скопировать перевод:", self._hk_copy)
+
         self._interval = QSpinBox()
         self._interval.setRange(500, 10000)
         self._interval.setSingleStep(100)
@@ -218,6 +222,7 @@ class SettingsDialog(QDialog):
         c = self._config
         self._hk_select.setText(c.get("general", "hotkey_select", fallback="ctrl+shift+t"))
         self._hk_toggle.setText(c.get("general", "hotkey_toggle", fallback="ctrl+shift+p"))
+        self._hk_copy.setText(c.get("general", "hotkey_copy", fallback="ctrl+shift+c"))
         self._interval.setValue(c.getint("general", "capture_interval_ms", fallback=1500))
 
         src = c.get("languages", "source_lang", fallback="auto")
@@ -258,6 +263,7 @@ class SettingsDialog(QDialog):
         c = self._config
         c["general"]["hotkey_select"] = self._hk_select.text().strip()
         c["general"]["hotkey_toggle"] = self._hk_toggle.text().strip()
+        c["general"]["hotkey_copy"] = self._hk_copy.text().strip()
         c["general"]["capture_interval_ms"] = str(self._interval.value())
 
         c["languages"]["source_lang"] = self._source_lang.currentData()
