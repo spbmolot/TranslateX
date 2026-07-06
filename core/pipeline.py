@@ -260,11 +260,36 @@ class AppController(QObject):
 
     def reload_config(self, config: configparser.ConfigParser) -> None:
         """Apply updated settings without restarting."""
+        old_langs = set(self._ocr_languages())
+        old_gpu = self._config.getboolean("ocr", "gpu", fallback=False)
         self._config = config
         interval = config.getint("general", "capture_interval_ms", fallback=1500)
         self._timer.setInterval(interval)
         self._cache._ttl = config.getint("general", "cache_ttl_seconds", fallback=3600)
         self._cache._max_size = config.getint("general", "cache_max_size", fallback=500)
+
+        # Смена языков или GPU требует пересоздания EasyOCR Reader'а —
+        # раньше настройка молча не применялась до перезапуска приложения.
+        # Lazy-load делает рестарт дешёвым: убиваем воркер, следующий
+        # start() поднимет его с новыми параметрами (и продолжит перевод,
+        # если он был активен).
+        new_langs = set(self._ocr_languages())
+        new_gpu = config.getboolean("ocr", "gpu", fallback=False)
+        if self._ocr_worker is not None and (new_langs != old_langs or new_gpu != old_gpu):
+            was_active = self._active
+            if was_active:
+                self.stop()
+            self._ocr_worker.stop()
+            self._ocr_worker = None
+            # Дедуп-кэши больше невалидны: другой Reader может распознать иначе
+            self._last_ocr_signature = None
+            self._last_translated_blocks = None
+            logger.info(
+                f"OCR worker перезапускается: языки {sorted(old_langs)} → "
+                f"{sorted(new_langs)}, gpu {old_gpu} → {new_gpu}"
+            )
+            if was_active:
+                self.start()  # лениво пересоздаст воркер с новым конфигом
 
     # ── Frame-diff helpers ─────────────────────────────────────────────
 

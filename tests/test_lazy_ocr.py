@@ -85,6 +85,53 @@ def test_shutdown_with_no_worker_is_safe(controller):
     controller.shutdown()  # не должно упасть при _ocr_worker=None
 
 
+def _cfg(source="auto", target="ru", gpu="false"):
+    cfg = configparser.ConfigParser()
+    cfg["general"] = {"capture_interval_ms": "500",
+                      "cache_ttl_seconds": "3600", "cache_max_size": "100"}
+    cfg["languages"] = {"source_lang": source, "target_lang": target}
+    cfg["translation"] = {"provider": "google", "deepl_api_key": ""}
+    cfg["overlay"] = {"min_confidence": "0.4"}
+    cfg["ocr"] = {"gpu": gpu}
+    return cfg
+
+
+def test_language_change_recreates_worker(controller, worker_cls):
+    """Смена языка в настройках должна перезапустить OCR worker —
+    раньше настройка молча не применялась до перезапуска приложения."""
+    controller.set_region(QRect(0, 0, 100, 100))
+    controller.start()
+    assert worker_cls.call_count == 1
+    old_worker = controller._ocr_worker
+
+    controller.reload_config(_cfg(source="ja"))  # en+ru → ja+en+ru
+    old_worker.stop.assert_called_once()
+    # Перевод был активен → воркер пересоздан сразу (mock возвращает тот же
+    # инстанс, поэтому сравниваем по числу вызовов конструктора)
+    assert worker_cls.call_count == 2
+
+
+def test_same_config_keeps_worker(controller, worker_cls):
+    controller.set_region(QRect(0, 0, 100, 100))
+    controller.start()
+    worker = controller._ocr_worker
+    controller.reload_config(_cfg())  # те же языки/gpu
+    assert controller._ocr_worker is worker
+    worker.stop.assert_not_called()
+
+
+def test_language_change_while_active_restarts_translation(controller, worker_cls):
+    """Если перевод шёл — после смены языка он продолжает идти с новым воркером."""
+    controller.set_region(QRect(0, 0, 100, 100))
+    controller.start()
+    assert controller._active
+
+    controller.reload_config(_cfg(target="de"))
+    assert controller._active                 # перевод продолжается
+    assert worker_cls.call_count == 2         # воркер пересоздан
+    assert controller._ocr_worker is not None
+
+
 # ── last_translation_text (для хоткея копирования) ─────────────────────
 
 def _tb(text):
