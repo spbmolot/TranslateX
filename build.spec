@@ -97,12 +97,49 @@ a = Analysis(
         "notebook",
         "jupyter",
         "pytest",
-        # ВНИМАНИЕ: scipy И sklearn НЕ исключать — EasyOCR требует scipy.
+        # ВНИМАНИЕ: scipy НЕ исключать — EasyOCR требует scipy.
         # ВНИМАНИЕ: torch.distributions/testing/onnx НЕ исключать —
         # их отсутствие ломает `import torch` в frozen-сборке.
         "torch.utils.tensorboard",
         "torchaudio",
         "skimage.io._plugins",
+        # ── Обрезаем экспортную цепочку torch.onnx → onnxscript ────────
+        # onnxscript/onnx нужны только dev-скрипту export_onnx.py; рантайм
+        # использует чистый onnxruntime. Без этих excludes PyInstaller
+        # тащит transformers/openai/sklearn и падает на onnxscript.
+        "onnxscript",
+        "onnx",
+        "onnx_ir",
+        "onnxruntime.transformers",
+        # ── Тяжёлые пакеты dev-окружения, не относящиеся к приложению ──
+        "transformers",
+        "tokenizers",
+        "huggingface_hub",
+        "safetensors",
+        "tiktoken",
+        "openai",
+        "fastapi",
+        "starlette",
+        "typer",
+        "sklearn",
+        "faiss",
+        "numba",
+        "llvmlite",
+        "redis",
+        "gunicorn",
+        "aiohttp",
+        "debugpy",
+        "ipykernel",
+        "ipywidgets",
+        "jupyter_client",
+        "jupyter_core",
+        "tornado",
+        "zmq",
+        "git",
+        "gitdb",
+        "coverage",
+        "greenlet",
+        "dill",
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
