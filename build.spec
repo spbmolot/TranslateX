@@ -25,6 +25,17 @@ if easyocr_model_dir.exists():
         if model_file.is_file():
             added_files.append((str(model_file), "model"))
 
+# PERF-006: ONNX-модели ([ocr].backend=onnx) — если экспортированы
+# (scripts/export_onnx.py). Берём только рантайм-набор: детектор,
+# INT8-распознаватель и метаданные (fp32-распознаватель не нужен).
+# Каталог "models_onnx" — его ищет core.ocr_backends.onnx_backend.find_model_dir.
+onnx_model_dir = ROOT / "assets" / "models" / "onnx"
+if onnx_model_dir.exists():
+    for name in ("craft.onnx", "recognizer.int8.onnx", "meta.json"):
+        f = onnx_model_dir / name
+        if f.exists():
+            added_files.append((str(f), "models_onnx"))
+
 # ─── Hidden imports (PyQt5 + EasyOCR internals) ────────────────────────────
 hidden_imports = [
     # Qt
@@ -53,6 +64,9 @@ hidden_imports = [
     # mss
     "mss",
     "mss.windows",
+    # ONNX-бэкенд (PERF-006); scipy.ndimage нужен vendored-постпроцессингу
+    "onnxruntime",
+    "scipy.ndimage",
     # pystray / keyboard
     "pystray",
     "keyboard",
