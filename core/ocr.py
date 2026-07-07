@@ -116,15 +116,37 @@ class OcrWorker(QThread):
     error = pyqtSignal(str)
 
     def __init__(self, languages: List[str], min_confidence: float = 0.4,
-                 use_gpu: bool = False, parent=None):
+                 use_gpu: bool = False, backend: str = "easyocr", parent=None):
         super().__init__(parent)
         self._languages = languages
         self._min_confidence = min_confidence
         self._use_gpu = use_gpu
+        self._backend = backend
         self._reader = None
 
+    def _try_init_onnx(self) -> bool:
+        """PERF-006: torch-free бэкенд на onnxruntime. False → фоллбэк easyocr."""
+        try:
+            from core.ocr_backends.onnx_backend import OnnxReader, find_model_dir
+            model_dir = find_model_dir()
+            if model_dir is None:
+                logger.warning(
+                    "ONNX-модели не найдены (сгенерируйте scripts/export_onnx.py) "
+                    "— фоллбэк на EasyOCR")
+                return False
+            self._reader = OnnxReader(model_dir, languages=self._languages)
+            logger.info("ONNX OCR backend ready")
+            return True
+        except Exception as e:
+            logger.warning(f"ONNX backend init failed ({e}) — фоллбэк на EasyOCR")
+            return False
+
     def run(self) -> None:
-        """Initialize EasyOCR (blocking) then enter idle loop."""
+        """Initialize OCR backend (blocking) then enter idle loop."""
+        if self._backend == "onnx" and self._try_init_onnx():
+            self.ready.emit()
+            self.exec_()
+            return
         try:
             import easyocr
             # Скопировать вшитые модели в ~/.EasyOCR/model, чтобы первый запуск
@@ -159,17 +181,38 @@ class OcrJobThread(QThread):
     """
     Lightweight one-shot thread for a single OCR job.
     Created fresh for each capture tick to avoid blocking OcrWorker's idle loop.
+
+    PERF-007 (detector-skip): если переданы cached_boxes (детекция с прошлого
+    кадра, в координатах исходного кадра) и reader умеет detect/recognize —
+    детектор (самая дорогая стадия) пропускается, только распознавание.
+    При полном прогоне свежие боксы кладутся в self.last_boxes для кэша.
     """
     ocr_complete = pyqtSignal(object)
     error = pyqtSignal(str)
 
     def __init__(self, reader, image: np.ndarray, min_confidence: float,
-                 downscale: str = "auto", parent=None):
+                 downscale: str = "auto", cached_boxes=None, parent=None):
         super().__init__(parent)
         self._reader = reader
         self._image = image
         self._min_confidence = min_confidence
         self._downscale = downscale
+        self._cached_boxes = cached_boxes
+        self.used_cached_boxes = cached_boxes is not None
+        self.last_boxes = None  # (horizontal_list, free_list) в координатах кадра
+
+    @staticmethod
+    def _scale_boxes(boxes, factor: float):
+        """Масштабирует (horizontal_list, free_list). horizontal_list —
+        [x_min, x_max, y_min, y_max]; free_list — полигоны из точек."""
+        h_list = [
+            [int(round(float(v) * factor)) for v in box] for box in boxes[0]
+        ]
+        f_list = [
+            [[float(p[0]) * factor, float(p[1]) * factor] for p in poly]
+            for poly in boxes[1]
+        ]
+        return h_list, f_list
 
     def run(self) -> None:
         try:
@@ -177,7 +220,23 @@ class OcrJobThread(QThread):
             # в координатах ИСХОДНОГО кадра (умножаем на 1/scale).
             image, scale = preprocess_for_ocr(self._image, self._downscale)
             inv = 1.0 / scale
-            results = self._reader.readtext(image, detail=1, paragraph=False)
+
+            can_split = hasattr(self._reader, "detect") and hasattr(self._reader, "recognize")
+            if can_split:
+                if self._cached_boxes is not None:
+                    # PERF-007: recognize-only по кэшированным боксам
+                    h_list, f_list = self._scale_boxes(self._cached_boxes, scale)
+                else:
+                    h_lists, f_lists = self._reader.detect(image)
+                    h_list, f_list = h_lists[0], f_lists[0]
+                    # Кэш — в координатах исходного кадра
+                    self.last_boxes = self._scale_boxes((h_list, f_list), inv)
+                results = self._reader.recognize(
+                    image, h_list, f_list, detail=1, paragraph=False)
+            else:
+                # Реадер без detect/recognize (например, мок) — старый путь
+                results = self._reader.readtext(image, detail=1, paragraph=False)
+
             blocks = []
             for bbox, text, conf in results:
                 text = text.strip()

@@ -201,11 +201,17 @@ def load_config() -> configparser.ConfigParser:
             "min_confidence": "0.4",
         },
         "ocr": {
+            # easyocr (torch) | onnx (onnxruntime, PERF-006; нужны модели
+            # из scripts/export_onnx.py, иначе авто-фоллбэк на easyocr)
+            "backend": "easyocr",
             "gpu": "false",
             # Склейка OCR-строк в абзацы перед переводом (качество перевода)
             "group_paragraphs": "true",
             # PERF-002: даунсэмпл кадра перед OCR: auto | off | коэффициент 0..1
             "downscale": "auto",
+            # PERF-007: пропуск детектора на стабильных кадрах (recognize-only
+            # по кэшированным боксам, полный detect каждый 3-й прогон)
+            "detector_skip": "true",
         },
         "ui": {"theme": "auto"},  # auto | light | dark (U3)
     }

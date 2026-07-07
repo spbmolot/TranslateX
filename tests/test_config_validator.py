@@ -36,7 +36,8 @@ def _make_config(overrides: dict[str, dict[str, str]] | None = None) -> configpa
             "font_color": "#ffffff", "bg_color": "#1a1a2e",
             "min_confidence": "0.4",
         },
-        "ocr": {"gpu": "false", "group_paragraphs": "true", "downscale": "auto"},
+        "ocr": {"gpu": "false", "group_paragraphs": "true", "downscale": "auto",
+                "detector_skip": "true"},
     })
     if overrides:
         for section, kvs in overrides.items():

@@ -45,6 +45,16 @@
       "median_ms": 69227.095,
       "p95_ms": 72554.18,
       "n": 5
+    },
+    "onnx_readtext_1440p_auto": {
+      "median_ms": 7323.0,
+      "p95_ms": 8905.0,
+      "n": 5
+    },
+    "onnx_readtext_1440p_off": {
+      "median_ms": 17429.0,
+      "p95_ms": 23252.0,
+      "n": 5
     }
   }
 }

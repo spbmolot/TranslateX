@@ -28,6 +28,7 @@ except Exception:
 
 OUTDIR = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parent.parent
 MODE = sys.argv[2] if len(sys.argv) > 2 else "visual"   # visual | combat
+BACKEND = sys.argv[3] if len(sys.argv) > 3 else "easyocr"  # easyocr | onnx
 CONTENT = (100, 150, 620, 260)   # окно с текстом (x, y, w, h)
 SHOT = (60, 100, 700, 380)       # область скриншота
 TIMEOUT_S = 300
@@ -53,7 +54,9 @@ def make_config() -> configparser.ConfigParser:
             "font_color": "#ffffff", "bg_color": "#1a1a2e",
             "min_confidence": "0.4",
         },
-        "ocr": {"gpu": "false", "group_paragraphs": "true", "downscale": "auto"},
+        "ocr": {"backend": BACKEND, "gpu": "false",
+                "group_paragraphs": "true", "downscale": "auto",
+                "detector_skip": "true"},
         "ui": {"theme": "auto"},
     })
     return c
@@ -118,7 +121,7 @@ def main() -> int:
         qapp.processEvents()
         time.sleep(0.3)
         qapp.processEvents()
-        screenshot(f"e2e_after_{MODE}.png")
+        screenshot(f"e2e_after_{MODE}_{BACKEND}.png")
         text = app._controller.last_translation_text()
         print(f"[e2e] last_translation_text ({len(text)} chars):")
         for line in text.splitlines():

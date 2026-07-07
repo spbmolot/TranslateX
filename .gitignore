@@ -56,3 +56,6 @@ deepl_api_key.txt
 installer/version.iss
 
 build_log.txt
+
+# ONNX-артефакты (PERF-006): генерируются scripts/export_onnx.py на машине сборки
+assets/models/onnx/

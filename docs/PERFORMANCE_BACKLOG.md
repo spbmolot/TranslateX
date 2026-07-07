@@ -17,8 +17,8 @@
 | PERF-003 lazy-load OCR | ✅ сделано | Worker создаётся при первом start(); клик «Старт» не блокируется — pipeline ждёт Reader и стартует сам. Примечание: torch импортируется в main.py до PyQt5 (DLL-порядок), экономится Reader+модели, не сам torch |
 | PERF-005 incremental repaint | ✅ сделано | `update_blocks` пропускает repaint при неизменной сигнатуре (текст+bbox+цвет+регион); на статичном экране 0 перерисовок |
 | PERF-012 PreciseTimer | ✅ сделано | `pipeline.py`: `setTimerType(Qt.PreciseTimer)` |
-| PERF-006 ONNX + INT8 | ⬜ не начато | Следующий крупный шаг, см. план в карточке ниже |
-| PERF-007 detector-skip | ⬜ не начато | |
+| PERF-006 ONNX + INT8 | ✅ сделано (опция) | `[ocr].backend=onnx`: torch-free инференс (onnxruntime + vendored постпроцессинг easyocr). Экспорт: `scripts/export_onnx.py` (craft 83МБ fp32 + recognizer INT8 3.9МБ, паритет argmax 100%). Бенч 1440p: **7.3с vs 32.3с EasyOCR (×4.4)**; recall ≥90% (лат+кир, `tests/test_onnx_backend.py`). Дефолт пока easyocr; выкидывание torch из дистрибутива — отдельный packaging-шаг (build.spec) |
+| PERF-007 detector-skip | ✅ сделано | recognize-only по кэшированным боксам, полный detect каждый 3-й прогон; слабый результат инвалидирует кэш; работает с обоими бэкендами (`[ocr].detector_skip`, дефолт on) |
 | PERF-009 adaptive threshold | ❌ отклонено | Конфликтует с фиксом frame-diff: авто-повышение порога по EMA заново вводит риск «не заметили локальное изменение» (устаревший перевод), ради экономии OCR на видео-сценах, где и так работает resync-кэп 30 скипов. Не делаем, пока нет реальных жалоб на CPU при видео |
 | PERF-010 pipelining | ✅ сделано | Следующий capture планируется сразу после старта translation-джоба (OCR ∥ HTTP-перевод); результаты устаревших джобов отбрасываются по монотонному id |
 

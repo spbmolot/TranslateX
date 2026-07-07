@@ -147,6 +147,13 @@ class SettingsDialog(QDialog):
         w = QWidget()
         v = QVBoxLayout(w)
 
+        self._backend = QComboBox()
+        self._backend.addItem("EasyOCR (torch, по умолчанию)", "easyocr")
+        self._backend.addItem("ONNX (быстрее на CPU, эксперимент)", "onnx")
+        backend_row = QFormLayout()
+        backend_row.addRow("Движок распознавания:", self._backend)
+        v.addLayout(backend_row)
+
         self._gpu = QCheckBox("Ускорение на GPU (требуется NVIDIA CUDA)")
         v.addWidget(self._gpu)
 
@@ -243,6 +250,7 @@ class SettingsDialog(QDialog):
             self._radio_google.setChecked(True)
         self._deepl_key.setText(c.get("translation", "deepl_api_key", fallback=""))
 
+        self._select_combo(self._backend, c.get("ocr", "backend", fallback="easyocr"))
         self._gpu.setChecked(c.getboolean("ocr", "gpu", fallback=False))
         self._group_paragraphs.setChecked(
             c.getboolean("ocr", "group_paragraphs", fallback=True))
@@ -281,6 +289,7 @@ class SettingsDialog(QDialog):
 
         if not c.has_section("ocr"):
             c.add_section("ocr")
+        c["ocr"]["backend"] = self._backend.currentData() or "easyocr"
         c["ocr"]["gpu"] = "true" if self._gpu.isChecked() else "false"
         c["ocr"]["group_paragraphs"] = (
             "true" if self._group_paragraphs.isChecked() else "false")

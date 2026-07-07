@@ -197,8 +197,11 @@ def validate_and_fix(config: configparser.ConfigParser) -> List[str]:
     _check_float(config, "overlay", "min_confidence", 0.4, 0.0, 1.0, issues)
 
     # ── [ocr] ─────────────────────────────────────────────────
+    _check_str (config, "ocr", "backend", "easyocr",
+                issues, allowed={"easyocr", "onnx"}, label="OCR-бэкенд")
     _check_bool(config, "ocr", "gpu", False, issues)
     _check_bool(config, "ocr", "group_paragraphs", True, issues)
+    _check_bool(config, "ocr", "detector_skip", True, issues)
     # downscale: "auto" | "off" | float 0.1..1.0
     raw_ds = (config.get("ocr", "downscale", fallback="auto") or "").strip().lower()
     if raw_ds not in ("auto", "off"):

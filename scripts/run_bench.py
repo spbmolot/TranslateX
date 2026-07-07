@@ -28,7 +28,8 @@ except Exception:
 BASELINE_PATH = Path(__file__).resolve().parent.parent / "tests" / "benchmark" / "baseline.json"
 
 
-def run_all(include_ocr: bool, include_network: bool) -> dict:
+def run_all(include_ocr: bool, include_network: bool,
+            include_onnx: bool = False) -> dict:
     # bench_core сам импортирует torch до PyQt5 (конфликт c10.dll/CRT)
     from tests.benchmark import bench_core
     results = {}
@@ -41,6 +42,11 @@ def run_all(include_ocr: bool, include_network: bool) -> dict:
         results["ocr_readtext_1440p_auto"] = bench_core.bench_ocr_readtext(5, "auto")
         print("  ocr_readtext_1440p (downscale=off)…", flush=True)
         results["ocr_readtext_1440p_off"] = bench_core.bench_ocr_readtext(5, "off")
+    if include_onnx:
+        print("  onnx_readtext_1440p (downscale=auto→720p)…", flush=True)
+        results["onnx_readtext_1440p_auto"] = bench_core.bench_onnx_readtext(5, "auto")
+        print("  onnx_readtext_1440p (downscale=off)…", flush=True)
+        results["onnx_readtext_1440p_off"] = bench_core.bench_onnx_readtext(5, "off")
     if include_network:
         print("  translation_miss_network (5 строк ×5, реальная сеть)…", flush=True)
         results["translation_miss_network_5"] = bench_core.bench_translation_miss_network(5)
@@ -74,12 +80,14 @@ def main() -> int:
     ap.add_argument("--compare", action="store_true",
                     help="сравнить с сохранённым baseline.json")
     ap.add_argument("--ocr", action="store_true", help="включить бенч EasyOCR")
+    ap.add_argument("--onnx", action="store_true",
+                    help="включить бенч ONNX-бэкенда (нужны модели export_onnx.py)")
     ap.add_argument("--network", action="store_true",
                     help="включить сетевой бенч перевода")
     args = ap.parse_args()
 
     print("Запуск бенчей…")
-    results = run_all(args.ocr, args.network)
+    results = run_all(args.ocr, args.network, args.onnx)
 
     baseline = None
     if args.compare:

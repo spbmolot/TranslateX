@@ -79,6 +79,11 @@ class AppController(QObject):
         self._frame_skip_count = 0  # сколько кадров подряд скипнули по diff
         # Последний захваченный кадр — для сэмплирования цвета фона (inpaint)
         self._last_capture_image: Optional[np.ndarray] = None
+        # PERF-007 (detector-skip): боксы последней полной детекции
+        # (в координатах кадра) + счётчик recognize-only прогонов подряд.
+        # Полный detect — каждый 3-й OCR-прогон (кэп устаревания боксов).
+        self._last_det_boxes = None
+        self._det_skip_count = 0
 
         # Cache
         self._cache = TranslationCache(
@@ -157,6 +162,9 @@ class AppController(QObject):
             self._last_frame_signature = None
             self._last_frame_shape = None
             self._frame_skip_count = 0
+            # Боксы детекции принадлежали старой области
+            self._last_det_boxes = None
+            self._det_skip_count = 0
         # DEBUG, не INFO: рамку пользователь может двигать десятки раз
         # в секунду — это засоряло бы production-лог сотнями записей.
         logger.debug(f"Capture region set: {region}")
@@ -170,6 +178,7 @@ class AppController(QObject):
             languages=langs,
             min_confidence=self._config.getfloat("overlay", "min_confidence", fallback=0.4),
             use_gpu=self._config.getboolean("ocr", "gpu", fallback=False),
+            backend=self._config.get("ocr", "backend", fallback="easyocr"),
             parent=self,
         )
         self._ocr_worker.ready.connect(self._on_ocr_ready)
@@ -262,6 +271,7 @@ class AppController(QObject):
         """Apply updated settings without restarting."""
         old_langs = set(self._ocr_languages())
         old_gpu = self._config.getboolean("ocr", "gpu", fallback=False)
+        old_backend = self._config.get("ocr", "backend", fallback="easyocr")
         self._config = config
         interval = config.getint("general", "capture_interval_ms", fallback=1500)
         self._timer.setInterval(interval)
@@ -275,7 +285,10 @@ class AppController(QObject):
         # если он был активен).
         new_langs = set(self._ocr_languages())
         new_gpu = config.getboolean("ocr", "gpu", fallback=False)
-        if self._ocr_worker is not None and (new_langs != old_langs or new_gpu != old_gpu):
+        new_backend = config.get("ocr", "backend", fallback="easyocr")
+        if self._ocr_worker is not None and (
+            new_langs != old_langs or new_gpu != old_gpu or new_backend != old_backend
+        ):
             was_active = self._active
             if was_active:
                 self.stop()
@@ -286,7 +299,8 @@ class AppController(QObject):
             self._last_translated_blocks = None
             logger.info(
                 f"OCR worker перезапускается: языки {sorted(old_langs)} → "
-                f"{sorted(new_langs)}, gpu {old_gpu} → {new_gpu}"
+                f"{sorted(new_langs)}, gpu {old_gpu} → {new_gpu}, "
+                f"backend {old_backend} → {new_backend}"
             )
             if was_active:
                 self.start()  # лениво пересоздаст воркер с новым конфигом
@@ -348,6 +362,20 @@ class AppController(QObject):
         if hh < h:
             tile_max = max(tile_max, float(diff[hh:, :].mean()))
         return tile_max < threshold
+
+    def _next_cached_boxes(self):
+        """PERF-007: боксы для recognize-only прогона или None (полный detect).
+        Политика: не больше 2 recognize-only подряд, затем полный detect —
+        ограничивает устаревание раскладки ~3 тиками."""
+        if (
+            self._config.getboolean("ocr", "detector_skip", fallback=True)
+            and self._last_det_boxes is not None
+            and self._det_skip_count < 2
+        ):
+            self._det_skip_count += 1
+            return self._last_det_boxes
+        self._det_skip_count = 0
+        return None
 
     def _reschedule_tick(self) -> None:
         """Планирует следующий capture-тик. Таймер single-shot: перезапускается
@@ -433,6 +461,7 @@ class AppController(QObject):
             image=image,
             min_confidence=self._config.getfloat("overlay", "min_confidence", fallback=0.4),
             downscale=self._config.get("ocr", "downscale", fallback="auto"),
+            cached_boxes=self._next_cached_boxes(),
             parent=self,
         )
         job.ocr_complete.connect(self._on_ocr_complete)
@@ -445,6 +474,26 @@ class AppController(QObject):
     def _on_ocr_complete(self, blocks: list) -> None:
         self._ocr_busy = False
         self._ocr_count += 1
+        # PERF-007: обновляем кэш боксов детекции. Полный прогон приносит
+        # свежие боксы; слабый recognize-only результат (пусто или низкая
+        # средняя уверенность — текст, вероятно, сместился) инвалидирует
+        # кэш, чтобы следующий тик сделал полный detect.
+        job = self.sender()
+        if job is not None:
+            fresh_boxes = getattr(job, "last_boxes", None)
+            if fresh_boxes is not None:
+                self._last_det_boxes = fresh_boxes
+            elif getattr(job, "used_cached_boxes", False):
+                weak = (
+                    not blocks
+                    or (sum(b.confidence for b in blocks) / len(blocks)) < 0.3
+                )
+                if weak:
+                    logger.debug(
+                        "Detector-skip: слабый recognize-only результат — "
+                        "следующий тик сделает полный detect"
+                    )
+                    self._last_det_boxes = None
         elapsed_ms = (time.time() - self._last_ocr_start_ts) * 1000
         n_blocks = len(blocks) if blocks else 0
         logger.info(

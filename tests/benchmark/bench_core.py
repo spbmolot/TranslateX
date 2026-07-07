@@ -186,6 +186,24 @@ def bench_ocr_readtext(n: int = 5, downscale: str = "auto") -> Dict:
     return _timeit(one, n, warmup=1)
 
 
+def bench_onnx_readtext(n: int = 5, downscale: str = "auto") -> Dict:
+    """PERF-006: OnnxReader.readtext на той же фикстуре, что bench_ocr_readtext.
+    Требует экспортированных моделей (scripts/export_onnx.py)."""
+    from core.ocr import preprocess_for_ocr
+    from core.ocr_backends.onnx_backend import OnnxReader, find_model_dir
+    model_dir = find_model_dir()
+    if model_dir is None:
+        raise RuntimeError("ONNX-модели не найдены — python scripts/export_onnx.py")
+    reader = OnnxReader(model_dir)
+    img = make_text_image(2560, 1440, font_size=28)
+
+    def one():
+        proc, _scale = preprocess_for_ocr(img, downscale)
+        reader.readtext(proc)
+
+    return _timeit(one, n, warmup=1)
+
+
 def bench_translation_miss_network(n: int = 5) -> Dict:
     """
     РЕАЛЬНЫЙ сетевой перевод 5 строк (Google, без кэша).
