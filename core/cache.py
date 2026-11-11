@@ -4,6 +4,7 @@ Thread-safe for concurrent reads; writes are serialized via a lock.
 """
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -34,6 +35,8 @@ class TranslationCache:
         self._ttl = ttl_seconds
         self._data: OrderedDict[Tuple[str, ...], Tuple[str, float]] = OrderedDict()
         self._lock = threading.Lock()
+        # Есть ли несохранённые на диск изменения (для save_if_dirty)
+        self._dirty = False
         self.load()
 
     def _key(self, text: str, target_lang: str,
@@ -69,21 +72,46 @@ class TranslationCache:
             if key in self._data:
                 self._data.move_to_end(key)
             self._data[key] = (translation, time.time())
+            self._dirty = True
+            while len(self._data) > self._max_size:
+                self._data.popitem(last=False)
+
+    def configure(self, max_size: int, ttl_seconds: int) -> None:
+        """Применить новые лимиты (смена настроек без перезапуска)."""
+        with self._lock:
+            self._max_size = max_size
+            self._ttl = ttl_seconds
             while len(self._data) > self._max_size:
                 self._data.popitem(last=False)
 
     def save(self) -> None:
+        """Атомарная запись: пишем во временный файл и подменяем основной
+        через os.replace — при сбое посреди записи старый кэш остаётся цел."""
         try:
             user_data_dir()  # гарантируем существование %APPDATA%\TranslateX
-            serializable = {
-                "||".join(k): list(v)
-                for k, v in self._data.items()
-            }
-            with open(_CACHE_FILE, "w", encoding="utf-8") as f:
-                json.dump(serializable, f, ensure_ascii=False, indent=2)
-            logger.debug(f"Cache saved: {len(self._data)} entries")
+            with self._lock:
+                serializable = {
+                    "||".join(k): list(v)
+                    for k, v in self._data.items()
+                }
+                self._dirty = False
+            tmp = _CACHE_FILE.with_name(_CACHE_FILE.name + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(serializable, f, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, _CACHE_FILE)
+            logger.debug(f"Cache saved: {len(serializable)} entries")
         except Exception as e:
+            self._dirty = True  # повторим при следующем автосохранении
             logger.warning(f"Failed to save cache: {e}")
+
+    def save_if_dirty(self) -> bool:
+        """Сохранить, только если были изменения с прошлой записи."""
+        if not self._dirty:
+            return False
+        self.save()
+        return True
 
     def load(self) -> None:
         if not _CACHE_FILE.exists():

@@ -66,10 +66,12 @@ hidden_imports = [
     "mss.windows",
     # ONNX-бэкенд (PERF-006); scipy.ndimage нужен vendored-постпроцессингу
     "onnxruntime",
+    # локальный перевод OPUS-MT
+    "ctranslate2",
+    "sentencepiece",
     "scipy.ndimage",
     # pystray / keyboard
     "pystray",
-    "keyboard",
     # stdlib
     "configparser",
     "logging",

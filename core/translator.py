@@ -1,6 +1,8 @@
 """
 Translation worker.
-Supports Google Translate (via deep-translator, free) and DeepL API.
+Провайдеры: google (deep-translator, бесплатно), deepl (API-ключ),
+local_fast (OPUS-MT на CPU, core/local_mt.py), local_llm (TranslateGemma
+через llama.cpp, GPU или CPU, core/local_llm.py).
 Runs in a QThread to avoid blocking the event loop.
 """
 import logging
@@ -97,11 +99,35 @@ def is_already_in_lang(text: str, lang: str, threshold: float = 0.6) -> bool:
     return (matched / len(letters)) >= threshold
 
 
+def _describe_error(exc: Exception) -> str:
+    """Короткая понятная пользователю причина сбоя перевода."""
+    from core.local_mt import LocalModelMissing
+    if isinstance(exc, LocalModelMissing):
+        return f"{exc} — скачайте её в Настройках → Перевод"
+    name = type(exc).__name__
+    low = (name + " " + str(exc)).lower()
+    if "127.0.0.1" in low:
+        return "локальная модель перевода не отвечает"
+    if "authorization" in low or "auth_key" in low or "403" in low:
+        return "неверный или неактивный API-ключ"
+    if "quota" in low:
+        return "исчерпан лимит API-ключа"
+    if "toomanyrequests" in low or "429" in low:
+        return "сервис ограничил частоту запросов"
+    if any(k in low for k in ("connection", "timeout", "timed out", "resolve",
+                              "ssl", "proxy", "network")):
+        return "нет связи с сервисом перевода"
+    return f"сервис перевода недоступен ({name})"
+
+
 class TranslationJobThread(QThread):
     """
     One-shot thread for translating a batch of TextBlocks.
     """
     translation_complete = pyqtSignal(object)  # list[TranslatedBlock]
+    # Промежуточный результат медленного провайдера (local_llm): блоки,
+    # переведённые к этому моменту — overlay заполняется по мере готовности.
+    translation_partial = pyqtSignal(object)   # list[TranslatedBlock]
 
     def __init__(
         self,
@@ -112,8 +138,22 @@ class TranslationJobThread(QThread):
         deepl_api_key: str,
         cache: TranslationCache,
         parent=None,
+        cache_only: bool = False,
+        llm_device: str = "auto",
     ):
         super().__init__(parent)
+        self._llm_device = llm_device
+        # True — джоб прерван (requestInterruption) ради более свежего текста;
+        # его результат неполон и на overlay не применяется.
+        self.interrupted = False
+        # cache_only: не ходить в сеть (идёт backoff после сбоя сервиса) —
+        # отдаём попадания кэша, остальное остаётся оригиналом.
+        self._cache_only = cache_only
+        # Итог для контроллера (читается после translation_complete):
+        self.source_blocks = blocks
+        self.attempted_count = 0   # сколько блоков ушло в сервис перевода
+        self.failed_count = 0      # сколько из них не перевелось
+        self.error_text = ""       # краткая причина последнего сбоя
         self._blocks = blocks
         self._target = target_lang
         self._source = source_lang
@@ -141,7 +181,9 @@ class TranslationJobThread(QThread):
                 to_translate.append((i, block.text))
 
         # Batch translate cache misses
-        if to_translate:
+        if to_translate and not self._cache_only and self._provider == "local_llm":
+            self._run_llm(to_translate, translations)
+        elif to_translate and not self._cache_only:
             fresh = self._translate_batch([t for _, t in to_translate])
             failed = 0
             for (idx, original), translation in zip(to_translate, fresh):
@@ -153,13 +195,20 @@ class TranslationJobThread(QThread):
                     self._source, self._provider,
                 )
                 translations[idx] = translation
+            self.attempted_count = len(to_translate)
+            self.failed_count = failed
             if failed:
                 logger.warning(
                     f"{failed}/{len(to_translate)} block(s) failed to translate "
                     "(originals shown, not cached — will retry next tick)"
                 )
 
-        translated_blocks = [
+        self.translation_complete.emit(self._build_blocks(translations, partial=False))
+
+    def _build_blocks(self, translations, partial: bool) -> List[TranslatedBlock]:
+        """partial=True — только уже переведённые блоки; иначе все блоки,
+        непереведённые показываются оригиналом."""
+        return [
             TranslatedBlock(
                 original=block.text,
                 translated=tr if tr is not None else block.text,
@@ -168,9 +217,36 @@ class TranslationJobThread(QThread):
                 bg_rgb=getattr(block, "bg_rgb", None),
             )
             for block, tr in zip(self._blocks, translations)
+            if tr is not None or not partial
         ]
 
-        self.translation_complete.emit(translated_blocks)
+    def _run_llm(self, to_translate, translations) -> None:
+        """Локальная LLM: блоки по одному (секунды на блок на CPU), с
+        выдачей промежуточного результата и возможностью прерывания."""
+        from core import local_llm
+        attempted = failed = 0
+        for idx, original in to_translate:
+            if self.isInterruptionRequested():
+                self.interrupted = True
+                break
+            attempted += 1
+            try:
+                translation = local_llm.server().translate(
+                    original, self._source, self._target, self._llm_device)
+            except Exception as e:
+                logger.error(f"Local LLM translate failed: {e}")
+                self.error_text = _describe_error(e)
+                failed += 1
+                break  # движок не работает — остальные блоки не мучаем
+            if translation is None:
+                failed += 1
+                continue
+            self._cache.put(original, self._target, translation,
+                            self._source, self._provider)
+            translations[idx] = translation
+            self.translation_partial.emit(self._build_blocks(translations, partial=True))
+        self.attempted_count = attempted
+        self.failed_count = failed
 
     def _translate_batch(self, texts: List[str]) -> List[Optional[str]]:
         """
@@ -183,10 +259,14 @@ class TranslationJobThread(QThread):
         try:
             if self._provider == "deepl" and self._deepl_key:
                 return self._translate_deepl(texts)
+            elif self._provider == "local_fast":
+                from core import local_mt
+                return local_mt.translate(texts, self._source, self._target)
             else:
                 return self._translate_google(texts)
         except Exception as e:
             logger.error(f"Translation error: {e}")
+            self.error_text = _describe_error(e)
             return [None] * len(texts)
 
     def _google_one(self, text: str) -> Optional[str]:
@@ -203,6 +283,7 @@ class TranslationJobThread(QThread):
             return translated if translated else None
         except Exception as e:
             logger.warning(f"Google translate failed for {text!r}: {e}")
+            self.error_text = _describe_error(e)
             return None
 
     def _translate_google(self, texts: List[str]) -> List[Optional[str]]:
@@ -227,6 +308,7 @@ class TranslationJobThread(QThread):
             return [result.text]
         except Exception as e:
             logger.error(f"DeepL batch translate failed: {e}")
+            self.error_text = _describe_error(e)
             return [None] * len(texts)
 
     def _map_deepl_lang(self, lang: str) -> str:

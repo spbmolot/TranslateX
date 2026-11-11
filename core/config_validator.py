@@ -35,7 +35,7 @@ KNOWN_SOURCE_LANGS = {
 }
 KNOWN_TARGET_LANGS = KNOWN_SOURCE_LANGS - {"auto"}
 
-# Регэксп для hotkey-строки (keyboard library): сегменты через '+',
+# Регэксп для hotkey-строки (разбор — utils/hotkeys.py): сегменты через '+',
 # латиница/цифры/space, пробелы вокруг '+' допускаются.
 _HOTKEY_RE = re.compile(r"^[a-z0-9+\-_ ]+$", re.IGNORECASE)
 
@@ -173,7 +173,8 @@ def validate_and_fix(config: configparser.ConfigParser) -> List[str]:
 
     # ── [translation] ─────────────────────────────────────────
     _check_str(config, "translation", "provider", "google",
-               issues, allowed={"google", "deepl"}, label="Провайдер перевода")
+               issues, allowed={"google", "deepl", "local_fast", "local_llm"},
+               label="Провайдер перевода")
     # deepl_api_key — пустой допустим (только если provider=google).
     if (config.get("translation", "provider", fallback="google") == "deepl"
             and not config.get("translation", "deepl_api_key", fallback="").strip()):
@@ -182,6 +183,13 @@ def validate_and_fix(config: configparser.ConfigParser) -> List[str]:
             "Будет использоваться Google Translate."
         )
         config.set("translation", "provider", "google")
+
+    # ── [local] ───────────────────────────────────────────────
+    if not config.has_section("local"):
+        config.add_section("local")
+    _check_str(config, "local", "llm_device", "auto",
+               issues, allowed={"auto", "gpu", "cpu"},
+               label="Устройство для локальной LLM")
 
     # ── [overlay] ─────────────────────────────────────────────
     _check_str  (config, "overlay", "style", "inpaint",

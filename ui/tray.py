@@ -109,3 +109,13 @@ class SystemTray(QObject):
     def set_ocr_loading(self) -> None:
         self._tray.setToolTip(f"TranslateX v{__version__} — загрузка OCR...")
         self.set_status("загрузка OCR...")
+
+    def notify(self, message: str, warning: bool = False) -> None:
+        """Всплывающее уведомление из трея (видно и без рамки — например,
+        в полноэкранном режиме перевода)."""
+        self._tray.showMessage(
+            "TranslateX",
+            message,
+            QSystemTrayIcon.Warning if warning else QSystemTrayIcon.Information,
+            6000,
+        )

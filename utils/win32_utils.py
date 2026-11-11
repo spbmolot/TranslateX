@@ -90,3 +90,30 @@ def get_dpi_scale(hwnd: int) -> float:
         return dpi / 96.0
     except Exception:
         return 1.0
+
+
+# ── Единственный экземпляр приложения ────────────────────────────────────
+ERROR_ALREADY_EXISTS = 183
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_kernel32.CreateMutexW.restype = ctypes.wintypes.HANDLE
+_kernel32.CreateMutexW.argtypes = [
+    ctypes.c_void_p, ctypes.wintypes.BOOL, ctypes.wintypes.LPCWSTR]
+_kernel32.CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
+
+
+def acquire_single_instance(name: str):
+    """
+    Захватывает именованный мьютекс сессии пользователя.
+
+    Возвращает handle (его нужно держать живым до выхода из процесса —
+    Windows освободит мьютекс сама при завершении) или None, если
+    приложение с таким именем уже запущено в этой сессии.
+    При сбое самого API возвращает 0 — запуск не блокируем.
+    """
+    handle = _kernel32.CreateMutexW(None, False, f"Local\\{name}")
+    if not handle:
+        return 0
+    if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+        _kernel32.CloseHandle(handle)
+        return None
+    return handle

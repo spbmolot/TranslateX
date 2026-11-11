@@ -8,6 +8,9 @@ easyocr>=1.7.0
 deep-translator>=1.11.0
 deepl>=1.17.0
 pystray>=0.19.0
-keyboard>=0.13.5
 Pillow>=10.0.0
 numpy>=1.24.0
+requests>=2.31.0
+# Локальный перевод (провайдер local_fast): OPUS-MT без torch
+ctranslate2>=4.4.0
+sentencepiece>=0.2.0

@@ -13,6 +13,7 @@ TranslateX — Перевод текста с экрана в реальном �
 """
 import configparser
 import logging
+import logging.handlers
 import os
 import sys
 from pathlib import Path
@@ -140,14 +141,17 @@ user_data_dir()  # гарантируем существование катал�
 _LOG_FILE = log_path()
 _log_handlers = [logging.StreamHandler(sys.stdout)]
 try:
-    _log_handlers.append(logging.FileHandler(str(_LOG_FILE), mode="w", encoding="utf-8"))
+    # Ротация вместо перезаписи: лог прошлого запуска (в т.ч. упавшего)
+    # сохраняется — translatex.log + до 3 архивов по 2 МБ.
+    _log_handlers.append(logging.handlers.RotatingFileHandler(
+        str(_LOG_FILE), maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8"))
 except Exception as _e:
     print(f"[TranslateX] cannot open log file: {_e}", file=sys.stderr)
 
 logging.basicConfig(
     level=_log_level,
     format="%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%H:%M:%S",
+    datefmt="%Y-%m-%d %H:%M:%S",
     handlers=_log_handlers,
 )
 logger = logging.getLogger(__name__)
@@ -182,7 +186,15 @@ def load_config() -> configparser.ConfigParser:
             "cache_max_size": "500",
         },
         "languages": {"source_lang": "auto", "target_lang": "ru"},
+        # provider: google | deepl | local_fast (OPUS-MT, CPU) |
+        # local_llm (TranslateGemma через llama.cpp, GPU или CPU)
         "translation": {"provider": "google", "deepl_api_key": ""},
+        "local": {
+            # Где лежат скачанные модели; пусто = %LOCALAPPDATA%\\TranslateX\\models
+            "models_dir": "",
+            # auto — видеокарта, если подходит, иначе процессор | gpu | cpu
+            "llm_device": "auto",
+        },
         "overlay": {
             # inpaint: bbox заливается сэмплированным цветом фона, оригинал
             # полностью скрыт (стиль Google Lens). outline — прежний стиль:
@@ -250,6 +262,7 @@ class App(QObject):
 
         self._ocr_ready = False
         self._hotkeys_registered = False
+        self._hotkeys = None  # utils.hotkeys.GlobalHotkeys, создаётся лениво
 
         # Сигналы контроллера
         self._controller.translation_ready.connect(self._on_translation_ready)
@@ -260,6 +273,9 @@ class App(QObject):
         self._controller.ocr_loading.connect(self._frame.set_ocr_loading)
         self._controller.ocr_loading.connect(self._tray.set_ocr_loading)
         self._controller.status_message.connect(self._tray.set_status)
+        # Сбой/восстановление сервиса перевода — показываем явно, а не только в логе
+        self._controller.translation_failed.connect(self._on_translation_failed)
+        self._controller.translation_recovered.connect(self._on_translation_recovered)
         # Overlay не должен попадать в кадр захвата
         self._wire_overlay(self._overlay)
         # Счётчики в тулбаре фрейма
@@ -334,27 +350,48 @@ class App(QObject):
     # ── Горячие клавиши ──────────────────────────────────────────────
 
     def _register_hotkeys(self) -> None:
+        """Глобальные хоткеи через Win32 RegisterHotKey (utils/hotkeys.py).
+        Занятые или неразобранные сочетания не блокируют остальные —
+        о них сообщаем пользователю уведомлением из трея."""
+        cfg = self._config
+        bindings = [
+            ("Выбор области",
+             cfg.get("general", "hotkey_select", fallback="ctrl+shift+t"),
+             self._show_selector),
+            ("Вкл/выкл перевод",
+             cfg.get("general", "hotkey_toggle", fallback="ctrl+shift+p"),
+             self._toggle_translation),
+            ("Пауза",
+             cfg.get("general", "hotkey_pause", fallback="ctrl+shift+space"),
+             self._controller.toggle_pause),
+            ("Скопировать перевод",
+             cfg.get("general", "hotkey_copy", fallback="ctrl+shift+c"),
+             self._copy_last_translation),
+            ("Перевести весь экран",
+             cfg.get("general", "hotkey_fullscreen", fallback="ctrl+shift+f"),
+             self._translate_fullscreen),
+        ]
         try:
-            import keyboard
-            hk_select = self._config.get("general", "hotkey_select", fallback="ctrl+shift+t")
-            hk_toggle = self._config.get("general", "hotkey_toggle", fallback="ctrl+shift+p")
-            hk_pause = self._config.get("general", "hotkey_pause", fallback="ctrl+shift+space")
-            hk_copy = self._config.get("general", "hotkey_copy", fallback="ctrl+shift+c")
-            hk_fullscreen = self._config.get(
-                "general", "hotkey_fullscreen", fallback="ctrl+shift+f")
-
-            keyboard.add_hotkey(hk_select, lambda: QTimer.singleShot(0, self._show_selector), suppress=False)
-            keyboard.add_hotkey(hk_toggle, lambda: QTimer.singleShot(0, self._toggle_translation), suppress=False)
-            keyboard.add_hotkey(hk_pause, lambda: QTimer.singleShot(0, self._controller.toggle_pause), suppress=False)
-            keyboard.add_hotkey(hk_copy, lambda: QTimer.singleShot(0, self._copy_last_translation), suppress=False)
-            keyboard.add_hotkey(hk_fullscreen, lambda: QTimer.singleShot(0, self._translate_fullscreen), suppress=False)
-            self._hotkeys_registered = True
-            logger.info(
-                f"Горячие клавиши: {hk_select}, {hk_toggle}, {hk_pause} (pause), "
-                f"{hk_copy} (copy), {hk_fullscreen} (fullscreen)"
-            )
+            if self._hotkeys is None:
+                from utils.hotkeys import GlobalHotkeys
+                self._hotkeys = GlobalHotkeys()
+            self._hotkeys.unregister_all()
+            problems = self._hotkeys.register_all(bindings)
         except Exception as e:
             logger.warning(f"Не удалось зарегистрировать горячие клавиши: {e}")
+            return
+        self._hotkeys_registered = True
+        logger.info(
+            "Горячие клавиши: " + ", ".join(f"{t}={h}" for t, h, _ in bindings)
+        )
+        if problems:
+            for p in problems:
+                logger.warning(f"Горячая клавиша не зарегистрирована: {p}")
+            self._tray.notify(
+                "Не работают горячие клавиши:\n" + "\n".join(problems) +
+                "\nИзмените сочетания в Настройках.",
+                warning=True,
+            )
 
     # ── OCR готовность ───────────────────────────────────────────────
 
@@ -470,6 +507,21 @@ class App(QObject):
         )
         self._overlay.update_blocks(blocks, region)
 
+    @pyqtSlot(str)
+    def _on_translation_failed(self, reason: str) -> None:
+        self._tray.notify(
+            f"Не удалось перевести: {reason}.\n"
+            "Показан оригинал, попытки повторяются автоматически.",
+            warning=True,
+        )
+        if self._frame.isVisible():
+            self._frame.show_toast("Ошибка перевода")
+
+    @pyqtSlot()
+    def _on_translation_recovered(self) -> None:
+        if self._frame.isVisible():
+            self._frame.show_toast("Перевод восстановлен")
+
     # ── Полноэкранный перевод (как «перевести страницу» у Яндекса) ────
 
     @pyqtSlot()
@@ -531,12 +583,7 @@ class App(QObject):
         # Перекрасить кастомную рамку (тулбар/бордюр рисуются вручную, не через QSS).
         self._frame.refresh_theme()
         if self._hotkeys_registered:
-            try:
-                import keyboard
-                keyboard.unhook_all_hotkeys()
-            except Exception:
-                pass
-            self._register_hotkeys()
+            self._register_hotkeys()  # снимает старые сочетания и ставит новые
 
     # ── Выход ────────────────────────────────────────────────────────
 
@@ -546,6 +593,8 @@ class App(QObject):
         self._close_frame()
         self._overlay.hide()
         self._history.hide()
+        if self._hotkeys is not None:
+            self._hotkeys.close()
         self._controller.shutdown()
         self._qapp.quit()
 
@@ -560,6 +609,37 @@ def _install_excepthook() -> None:
     import threading as _threading
     _orig_excepthook = sys.excepthook
 
+    import time as _time
+    _dialog_state = {"open": False, "last_ts": 0.0}
+
+    def _show_crash_dialog(exc_type, exc_value) -> None:
+        """Сообщает пользователю о сбое. Только из GUI-потока, не чаще раза
+        в 30 с и не поверх уже открытого диалога (ошибка в таймере иначе
+        засыпала бы экран окнами)."""
+        if QApplication.instance() is None:
+            return
+        if _threading.current_thread() is not _threading.main_thread():
+            return
+        now = _time.monotonic()
+        if _dialog_state["open"] or (
+            _dialog_state["last_ts"] and now - _dialog_state["last_ts"] < 30
+        ):
+            return
+        _dialog_state["open"] = True
+        try:
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.critical(
+                None,
+                "TranslateX — ошибка",
+                "Произошла непредвиденная ошибка:\n\n"
+                f"{exc_type.__name__}: {exc_value}\n\n"
+                "Приложение продолжит работу, но может вести себя нестабильно. "
+                f"Подробности записаны в лог:\n{_LOG_FILE}",
+            )
+        finally:
+            _dialog_state["open"] = False
+            _dialog_state["last_ts"] = _time.monotonic()
+
     def _hook(exc_type, exc_value, exc_tb):
         try:
             logger.critical(
@@ -569,6 +649,11 @@ def _install_excepthook() -> None:
         except Exception:
             pass
         _orig_excepthook(exc_type, exc_value, exc_tb)
+        if not issubclass(exc_type, KeyboardInterrupt):
+            try:
+                _show_crash_dialog(exc_type, exc_value)
+            except Exception:
+                pass
 
     def _thread_hook(args):
         logger.critical(
@@ -594,6 +679,21 @@ def main() -> None:
     qapp = QApplication(sys.argv)
     qapp.setApplicationName("TranslateX")
     qapp.setQuitOnLastWindowClosed(False)
+
+    # Второй экземпляр дал бы два трея, двойные хоткеи и два overlay
+    # друг на друге — не запускаемся. Handle держим до конца процесса.
+    from utils.win32_utils import acquire_single_instance
+    instance_lock = acquire_single_instance("TranslateX.SingleInstance")
+    if instance_lock is None:
+        from PyQt5.QtWidgets import QMessageBox
+        logger.info("TranslateX уже запущен — второй экземпляр завершается")
+        QMessageBox.information(
+            None,
+            "TranslateX",
+            "TranslateX уже запущен — значок находится в области уведомлений (трее).",
+        )
+        sys.exit(0)
+    qapp._instance_lock = instance_lock  # type: ignore[attr-defined]
 
     config = load_config()
 

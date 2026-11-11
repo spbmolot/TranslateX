@@ -12,6 +12,7 @@ import numpy as np
 from PyQt5.QtCore import QObject, QRect, Qt, QTimer, pyqtSignal, pyqtSlot
 from PyQt5.QtWidgets import QApplication
 
+from core import local_llm, local_mt, models
 from core.cache import TranslationCache, normalize_text
 from core.capture import capture_to_numpy
 from core.inpaint import apply_bg_colors
@@ -38,6 +39,18 @@ class AppController(QObject):
     ocr_progress = pyqtSignal(int)        # число найденных OCR-блоков
     translation_progress = pyqtSignal(int)  # число переведённых блоков
     user_pause_changed = pyqtSignal(bool)   # True=paused, False=resumed (для UI кнопки)
+    # Сервис перевода перестал отвечать (строка — причина) / снова отвечает.
+    # Эмитятся один раз на серию сбоев, а не на каждый неудачный запрос.
+    translation_failed = pyqtSignal(str)
+    translation_recovered = pyqtSignal()
+
+    # Backoff повторов перевода после сбоя: 2, 4, 8 … не больше 60 секунд
+    _RETRY_MAX_DELAY_S = 60
+    # Медленные провайдеры: одновременно только один джоб перевода, новый
+    # текст прерывает текущий (иначе на CPU копилась бы очередь на минуты).
+    _SERIAL_PROVIDERS = {"local_llm"}
+    # Автосохранение кэша переводов на диск (если были изменения)
+    _CACHE_AUTOSAVE_MS = 60_000
 
     def __init__(self, config: configparser.ConfigParser, parent=None):
         super().__init__(parent)
@@ -108,6 +121,26 @@ class AppController(QObject):
         self._timer.setTimerType(Qt.PreciseTimer)
         self._timer.setInterval(interval)
         self._timer.timeout.connect(self._on_timer_tick)
+
+        # Сбой перевода: повторяем ТОЛЬКО перевод тех же блоков (без нового
+        # OCR) с нарастающей задержкой. Раньше при неизменном экране повтора
+        # не было вовсе: дедуп по тексту переиспользовал «перевод»-оригинал.
+        self._trans_fail_streak = 0
+        self._retry_blocks: Optional[list] = None
+        # Учёт джобов перевода «в полёте» (см. _SERIAL_PROVIDERS)
+        self._trans_running = 0
+        self._inflight_signature: Optional[tuple] = None
+        self._queued_blocks: Optional[list] = None
+        models.configure(config)
+        self._retry_timer = QTimer(self)
+        self._retry_timer.setSingleShot(True)
+        self._retry_timer.timeout.connect(self._retry_translation)
+
+        # Кэш раньше писался только при штатном выходе и терялся при сбое.
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setInterval(self._CACHE_AUTOSAVE_MS)
+        self._autosave_timer.timeout.connect(self._cache.save_if_dirty)
+        self._autosave_timer.start()
 
     def _ocr_languages(self):
         source = self._config.get("languages", "source_lang", fallback="en")
@@ -214,6 +247,10 @@ class AppController(QObject):
         self._active = False
         self._user_paused = False  # сброс, чтобы при следующем start() не были на паузе
         self._timer.stop()
+        self._retry_timer.stop()
+        self._retry_blocks = None
+        self._trans_fail_streak = 0
+        self._queued_blocks = None
         self.status_message.emit("Остановлено")
         logger.info(
             f"Pipeline stopped. ticks={self._tick_count}, captures={self._capture_count}, "
@@ -272,11 +309,31 @@ class AppController(QObject):
         old_langs = set(self._ocr_languages())
         old_gpu = self._config.getboolean("ocr", "gpu", fallback=False)
         old_backend = self._config.get("ocr", "backend", fallback="easyocr")
+        old_provider = self._provider()
         self._config = config
+        models.configure(config)
+        new_provider = self._provider()
+        if new_provider != old_provider:
+            # Освобождаем память прежнего локального движка и заставляем
+            # текущий экран перевестись заново новым провайдером.
+            if old_provider == "local_llm":
+                local_llm.server().stop()
+            elif old_provider == "local_fast":
+                local_mt.unload()
+            self._last_ocr_signature = None
+            self._last_frame_signature = None
+            self._queued_blocks = None
         interval = config.getint("general", "capture_interval_ms", fallback=1500)
         self._timer.setInterval(interval)
-        self._cache._ttl = config.getint("general", "cache_ttl_seconds", fallback=3600)
-        self._cache._max_size = config.getint("general", "cache_max_size", fallback=500)
+        self._cache.configure(
+            max_size=config.getint("general", "cache_max_size", fallback=500),
+            ttl_seconds=config.getint("general", "cache_ttl_seconds", fallback=3600),
+        )
+        # Провайдер/ключ могли измениться — прежняя серия сбоев неактуальна,
+        # отложенный повтор выполняем сразу с новыми настройками.
+        self._trans_fail_streak = 0
+        if self._retry_timer.isActive():
+            self._retry_timer.start(0)
 
         # Смена языков или GPU требует пересоздания EasyOCR Reader'а —
         # раньше настройка молча не применялась до перезапуска приложения.
@@ -420,7 +477,10 @@ class AppController(QObject):
             image = capture_to_numpy(r.x(), r.y(), r.width(), r.height())
         except Exception as e:
             logger.error(f"Capture failed at tick #{self._tick_count}: {e}")
-            self.capture_finished.emit()
+            self.status_message.emit("Ошибка захвата экрана — повтор")
+            # Без перепланирования single-shot таймер больше не сработал бы
+            # и перевод молча встал бы до ручного Стоп/Старт.
+            self._reschedule_tick()
             return
         finally:
             self.capture_finished.emit()
@@ -445,7 +505,12 @@ class AppController(QObject):
             )
             # Переотображаем последний overlay (на случай если он был скрыт
             # перед захватом hide_overlay_for_capture'ом)
-            if self._last_translated_blocks is not None and self._region is not None:
+            if (
+                self._last_translated_blocks is not None
+                and self._region is not None
+                # пока идёт перевод нового текста, старый не возвращаем
+                and self._trans_running == 0
+            ):
                 self.translation_ready.emit(self._last_translated_blocks, self._region)
             self._reschedule_tick()
             return
@@ -555,6 +620,11 @@ class AppController(QObject):
         # Сигнатура нормализована (lower + схлоп пробелов, как ключ кэша):
         # OCR-дрожание регистра/пробелов между кадрами не считается изменением.
         signature = tuple(normalize_text(b.text or "") for b in blocks)
+        if self._trans_running > 0 and signature == self._inflight_signature:
+            # Этот же текст уже переводится — ждём результат, не дублируем
+            # запрос и не возвращаем на экран перевод прежнего текста.
+            self._reschedule_tick()
+            return
         if (
             signature == self._last_ocr_signature
             and self._last_translated_blocks is not None
@@ -584,8 +654,43 @@ class AppController(QObject):
             return
         self._last_ocr_signature = signature
 
+        if self._provider() in self._SERIAL_PROVIDERS and self._trans_running > 0:
+            # Медленный провайдер ещё переводит прежний текст: прерываем
+            # его (готовые блоки уже в кэше) и ставим свежий текст в очередь.
+            self._queued_blocks = blocks
+            try:
+                if self._current_trans_job is not None:
+                    self._current_trans_job.requestInterruption()
+            except RuntimeError:
+                pass  # объект уже удалён Qt-ом
+            self._reschedule_tick()
+            return
+
+        # Идёт backoff после сбоя сервиса: в сеть не ходим (cache_only),
+        # а отложенный повтор переключаем на свежие блоки.
+        # Признак — серия сбоев, а не активность таймера: пока повторный
+        # джоб в полёте, таймер уже неактивен, и обычный цикл слал бы второй
+        # сетевой запрос параллельно с повтором.
+        in_backoff = self._trans_fail_streak > 0
+        if in_backoff:
+            self._retry_blocks = blocks
+        self._start_translation_job(blocks, cache_only=in_backoff)
+        # PERF-010: не ждём конца перевода — планируем следующий capture
+        # сразу. OCR следующего кадра пойдёт параллельно с HTTP-переводом
+        # текущего (обе стадии в своих потоках), throughput выше.
+        self._reschedule_tick()
+
+    def _provider(self) -> str:
+        return self._config.get("translation", "provider", fallback="google")
+
+    def _start_translation_job(self, blocks: list, cache_only: bool = False) -> None:
         self._last_trans_start_ts = time.time()
         self._trans_job_seq += 1
+        self._trans_running += 1
+        self._inflight_signature = self._signature(blocks)
+        if (self._provider() == "local_llm" and not cache_only
+                and not local_llm.server().is_running()):
+            self.status_message.emit("Загрузка модели перевода…")
         job = TranslationJobThread(
             blocks=blocks,
             target_lang=self._config.get("languages", "target_lang", fallback="ru"),
@@ -594,20 +699,127 @@ class AppController(QObject):
             deepl_api_key=self._config.get("translation", "deepl_api_key", fallback=""),
             cache=self._cache,
             parent=self,
+            cache_only=cache_only,
+            llm_device=self._config.get("local", "llm_device", fallback="auto"),
         )
         job._job_id = self._trans_job_seq
         job.translation_complete.connect(self._on_translation_complete)
+        job.translation_partial.connect(self._on_translation_partial)
         job.finished.connect(job.deleteLater)
         self._current_trans_job = job
         job.start()
-        # PERF-010: не ждём конца перевода — планируем следующий capture
-        # сразу. OCR следующего кадра пойдёт параллельно с HTTP-переводом
-        # текущего (обе стадии в своих потоках), throughput выше.
-        self._reschedule_tick()
-        logger.debug(f"Translation job #{self._trans_job_seq} started for {n_blocks} block(s)")
+        logger.debug(
+            f"Translation job #{self._trans_job_seq} started for {len(blocks)} "
+            f"block(s){' [cache only]' if cache_only else ''}"
+        )
+
+    # ── Сбой сервиса перевода: уведомление + повтор с backoff ──────────
+
+    def _track_translation_health(self, job) -> None:
+        """Разбирает итог джоба: полный сбой → backoff-повтор и уведомление,
+        успех после серии сбоев → «восстановлено»."""
+        attempted = int(getattr(job, "attempted_count", 0) or 0)
+        failed = int(getattr(job, "failed_count", 0) or 0)
+        if not attempted:
+            return  # только кэш — о состоянии сервиса ничего не узнали
+        if failed < attempted:
+            if self._trans_fail_streak:
+                logger.info("Сервис перевода снова отвечает")
+                self._trans_fail_streak = 0
+                self._retry_timer.stop()
+                pending = self._retry_blocks
+                self._retry_blocks = None
+                self.status_message.emit("Перевод…")
+                self.translation_recovered.emit()
+                # Пока шёл повтор, на экране появился другой текст (он был
+                # показан cache-only) — переводим его сразу, иначе дедуп
+                # оставил бы оригинал до следующего изменения экрана.
+                if (
+                    pending
+                    and pending is not getattr(job, "source_blocks", None)
+                    and self._active
+                    and self._signature(pending) == self._last_ocr_signature
+                ):
+                    self._start_translation_job(pending)
+            return
+        # Ни один блок не перевёлся — сервис недоступен/ключ неверный/бан.
+        self._trans_fail_streak += 1
+        delay = min(self._RETRY_MAX_DELAY_S, 2 ** self._trans_fail_streak)
+        reason = getattr(job, "error_text", "") or "сервис перевода недоступен"
+        # Если за время запроса пришёл более свежий текст — повторяем его.
+        if self._retry_blocks is None:
+            self._retry_blocks = getattr(job, "source_blocks", None)
+        self._retry_timer.start(delay * 1000)
+        logger.warning(
+            f"Перевод не удался ({reason}), попытка #{self._trans_fail_streak}; "
+            f"повтор через {delay} с"
+        )
+        self.status_message.emit(f"Ошибка перевода: {reason}. Повтор через {delay} с")
+        if self._trans_fail_streak == 1:
+            self.translation_failed.emit(reason)
+
+    @pyqtSlot()
+    def _retry_translation(self) -> None:
+        blocks = self._retry_blocks
+        if not self._active or not blocks:
+            self._trans_fail_streak = 0
+            self._retry_blocks = None
+            return
+        if self._user_paused:
+            # На паузе в сеть не ходим; проверим снова позже.
+            self._retry_timer.start(self._RETRY_MAX_DELAY_S * 1000)
+            return
+        if self._signature(blocks) != self._last_ocr_signature:
+            # Текст исчез/сменилась область — повторять нечего. Снимаем
+            # backoff, следующий текст переведёт обычный цикл.
+            self._trans_fail_streak = 0
+            self._retry_blocks = None
+            return
+        self._start_translation_job(blocks)
+
+    @staticmethod
+    def _signature(blocks: list) -> tuple:
+        return tuple(normalize_text(b.text or "") for b in blocks)
+
+    def _start_queued(self) -> None:
+        """Запустить перевод текста, пришедшего во время работы медленного
+        провайдера (если он всё ещё на экране)."""
+        blocks, self._queued_blocks = self._queued_blocks, None
+        if (
+            blocks
+            and self._active
+            and self._trans_running == 0
+            and self._signature(blocks) == self._last_ocr_signature
+        ):
+            self._start_translation_job(
+                blocks, cache_only=self._trans_fail_streak > 0)
+
+    @pyqtSlot(object)
+    def _on_translation_partial(self, translated_blocks: list) -> None:
+        """Промежуточный результат медленного провайдера: показываем уже
+        переведённые блоки, не дожидаясь остальных."""
+        sender = self.sender()
+        job_id = getattr(sender, "_job_id", None) if sender is not None else None
+        if job_id is not None and job_id != self._trans_job_seq:
+            return  # уже запущен более новый джоб
+        if self._queued_blocks is not None or not self._active:
+            return  # текст на экране сменился — этот результат устарел
+        if self._region is not None:
+            self.translation_ready.emit(translated_blocks, self._region)
 
     @pyqtSlot(object)
     def _on_translation_complete(self, translated_blocks: list) -> None:
+        self._trans_running = max(0, self._trans_running - 1)
+        if self._trans_running == 0:
+            self._inflight_signature = None
+        _sender = self.sender()
+        if _sender is not None and getattr(_sender, "interrupted", False) is True:
+            # Прерван ради более свежего текста: неполный результат на
+            # overlay не применяем (готовые блоки уже лежат в кэше).
+            logger.debug("Translation job interrupted — starting queued text")
+            self._start_queued()
+            self._reschedule_tick()
+            return
         # PERF-010: отбрасываем результат джоба, если результат более НОВОГО
         # джоба уже применён к overlay (перевод старого всё равно лёг в кэш).
         # Просто «запущен более новый» — не повод дропать: старый результат
@@ -621,9 +833,12 @@ class AppController(QObject):
                     f"Translation job #{job_id} dropped "
                     f"(overlay already has #{self._last_applied_trans_id})"
                 )
+                self._start_queued()
                 self._reschedule_tick()
                 return
             self._last_applied_trans_id = job_id
+        if sender is not None:
+            self._track_translation_health(sender)
         self._trans_count += 1
         elapsed_ms = (time.time() - self._last_trans_start_ts) * 1000
         n = len(translated_blocks) if translated_blocks else 0
@@ -646,6 +861,7 @@ class AppController(QObject):
         self._last_translated_blocks = translated_blocks
         if self._region is not None:
             self.translation_ready.emit(translated_blocks, self._region)
+        self._start_queued()
         # Цикл capture→OCR→translate закрыт — планируем следующий capture.
         self._reschedule_tick()
 
@@ -664,6 +880,8 @@ class AppController(QObject):
     def shutdown(self) -> None:
         """Clean shutdown — save cache, stop workers, wait for in-flight jobs."""
         self._timer.stop()
+        self._retry_timer.stop()
+        self._autosave_timer.stop()
         self._active = False
         for job in (self._current_ocr_job, self._current_trans_job):
             try:
@@ -672,6 +890,7 @@ class AppController(QObject):
             except RuntimeError:
                 pass  # объект уже удалён Qt-ом
         self._cache.save()
+        local_llm.server().stop()
         if self._ocr_worker is not None:
             self._ocr_worker.stop()
         logger.info("Pipeline shut down")
