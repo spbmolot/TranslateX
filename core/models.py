@@ -65,13 +65,14 @@ class Component:
     files: List[RemoteFile]
     marker: str                    # файл, наличие которого = «установлено»
     extra_markers: List[str] = field(default_factory=list)
+    root: Optional[Path] = None
 
     @property
     def size(self) -> int:
         return sum(f.size for f in self.files)
 
     def directory(self) -> Path:
-        return models_dir() / self.key
+        return (self.root or models_dir()) / self.key
 
     def is_installed(self) -> bool:
         d = self.directory()
@@ -107,9 +108,9 @@ def models_dir() -> Path:
 
 # ── Реестр компонентов ───────────────────────────────────────────────────
 
-def llm_model() -> Component:
+def llm_model(root: Optional[Path] = None) -> Component:
     return Component(
-        key="llm",
+        key="llm", root=root,
         title="Модель TranslateGemma 4B",
         files=[RemoteFile(
             _LLM_URL, 2_489_909_312,
@@ -136,16 +137,16 @@ _LLAMA_VARIANTS = {
 }
 
 
-def llama_runtime(variant: str) -> Component:
+def llama_runtime(variant: str, root: Optional[Path] = None) -> Component:
     title, files = _LLAMA_VARIANTS[variant]
     return Component(key=f"llama-{LLAMA_TAG}-{variant}", title=title,
-                     files=files, marker="llama-server.exe")
+                     files=files, marker="llama-server.exe", root=root)
 
 
-def opus_model(src: str, tgt: str) -> Component:
+def opus_model(src: str, tgt: str, root: Optional[Path] = None) -> Component:
     pair = f"{src}-{tgt}"
     return Component(
-        key=f"opus-mt-{pair}",
+        key=f"opus-mt-{pair}", root=root,
         title=f"Быстрая модель {src}→{tgt}",
         files=[RemoteFile(OPUS_URL_TEMPLATE.format(pair=pair), 80_000_000, None, True)],
         marker="model.bin",

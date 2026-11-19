@@ -24,6 +24,7 @@ import configparser
 import logging
 import re
 from typing import Callable, List, Optional
+from core.shortcuts import HOTKEY_DEFAULTS, parse_hotkey
 
 logger = logging.getLogger(__name__)
 
@@ -34,10 +35,6 @@ KNOWN_SOURCE_LANGS = {
     "it", "pt", "nl", "pl", "ar", "tr", "uk",
 }
 KNOWN_TARGET_LANGS = KNOWN_SOURCE_LANGS - {"auto"}
-
-# Регэксп для hotkey-строки (разбор — utils/hotkeys.py): сегменты через '+',
-# латиница/цифры/space, пробелы вокруг '+' допускаются.
-_HOTKEY_RE = re.compile(r"^[a-z0-9+\-_ ]+$", re.IGNORECASE)
 
 _HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
@@ -151,16 +148,15 @@ def validate_and_fix(config: configparser.ConfigParser) -> List[str]:
     issues: List[str] = []
 
     # ── [general] ─────────────────────────────────────────────
-    _check_str(config, "general", "hotkey_select", "ctrl+shift+t",
-               issues, pattern=_HOTKEY_RE, label="Горячая клавиша 'Выбор области'")
-    _check_str(config, "general", "hotkey_toggle", "ctrl+shift+p",
-               issues, pattern=_HOTKEY_RE, label="Горячая клавиша 'Вкл/выкл'")
-    _check_str(config, "general", "hotkey_pause", "ctrl+shift+space",
-               issues, pattern=_HOTKEY_RE, label="Горячая клавиша 'Пауза'")
-    _check_str(config, "general", "hotkey_copy", "ctrl+shift+c",
-               issues, pattern=_HOTKEY_RE, label="Горячая клавиша 'Копировать'")
-    _check_str(config, "general", "hotkey_fullscreen", "ctrl+shift+f",
-               issues, pattern=_HOTKEY_RE, label="Горячая клавиша 'Весь экран'")
+    for key, default in HOTKEY_DEFAULTS.items():
+        shortcut = config.get("general", key, fallback=default).strip()
+        if shortcut:
+            try:
+                parse_hotkey(shortcut)
+            except ValueError as exc:
+                issues.append(f"{key}: {exc}. Сочетание отключено.")
+                shortcut = ""
+        config.set("general", key, shortcut)
     _check_int(config, "general", "capture_interval_ms", 1500, 100, 10000, issues)
     _check_int(config, "general", "cache_ttl_seconds",  3600, 0, 86400 * 30, issues)
     _check_int(config, "general", "cache_max_size",     500, 1, 100000, issues)

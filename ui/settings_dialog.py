@@ -3,18 +3,22 @@
 Вкладки: Общее · Языки · Перевод · OCR · Отображение.
 """
 import configparser
+import copy
+import io
 import logging
+from pathlib import Path
 
-from PyQt5.QtCore import pyqtSignal
+from PyQt5.QtCore import QIODevice, QSaveFile, QSize, pyqtSignal
 from PyQt5.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
-    QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-    QMessageBox, QPushButton, QRadioButton, QSpinBox, QTabWidget,
+    QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+    QMessageBox, QPushButton, QRadioButton, QScrollArea, QSpinBox, QTabWidget,
     QVBoxLayout, QWidget,
 )
 
 from core import hardware, local_mt, models
 from core.__version__ import __version__
+from core.shortcuts import HOTKEY_DEFAULTS, parse_hotkey
 from core.paths import config_path, user_data_dir
 
 logger = logging.getLogger(__name__)
@@ -46,26 +50,31 @@ class SettingsDialog(QDialog):
 
     def __init__(self, config: configparser.ConfigParser, parent=None):
         super().__init__(parent)
-        self._config = config
-        # Каталог моделей меняется «вживую» (чтобы статус был верным);
-        # при отмене диалога возвращаем прежний.
-        self._orig_models_dir = config.get("local", "models_dir", fallback="")
+        self._config = copy.deepcopy(config)
         self._gpu_info = hardware.detect_gpu()
         self.setWindowTitle(f"TranslateX v{__version__} — Настройки")
-        self.setMinimumWidth(480)
-        self.setMinimumHeight(420)
         self._build_ui()
         self._load_values()
+        # On a scaled laptop screen the tabs can scroll while Save stays visible.
+        available = self.screen().availableGeometry().size() - QSize(32, 64)
+        self.resize(self.sizeHint().expandedTo(QSize(520, 460)).boundedTo(available))
 
     # -------- UI --------
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
         self._tabs = QTabWidget()
-        self._tabs.addTab(self._build_tab_general(), "Общее")
-        self._tabs.addTab(self._build_tab_languages(), "Языки")
-        self._tabs.addTab(self._build_tab_provider(), "Перевод")
-        self._tabs.addTab(self._build_tab_ocr(), "OCR")
-        self._tabs.addTab(self._build_tab_overlay(), "Отображение")
+        for page, title in (
+            (self._build_tab_general(), "Общее"),
+            (self._build_tab_languages(), "Языки"),
+            (self._build_tab_provider(), "Перевод"),
+            (self._build_tab_ocr(), "OCR"),
+            (self._build_tab_overlay(), "Отображение"),
+        ):
+            scroll = QScrollArea()
+            scroll.setFrameShape(QFrame.NoFrame)
+            scroll.setWidgetResizable(True)
+            scroll.setWidget(page)
+            self._tabs.addTab(scroll, title)
         root.addWidget(self._tabs)
 
         buttons = QDialogButtonBox()
@@ -80,23 +89,23 @@ class SettingsDialog(QDialog):
         form = QFormLayout(w)
 
         self._hk_select = QLineEdit()
-        self._hk_select.setPlaceholderText("напр. ctrl+shift+t")
+        self._hk_select.setPlaceholderText("Отключено")
         form.addRow("Горячая клавиша — выбор области:", self._hk_select)
 
         self._hk_toggle = QLineEdit()
-        self._hk_toggle.setPlaceholderText("напр. ctrl+shift+p")
+        self._hk_toggle.setPlaceholderText("Отключено")
         form.addRow("Горячая клавиша — вкл/выкл перевод:", self._hk_toggle)
 
         self._hk_pause = QLineEdit()
-        self._hk_pause.setPlaceholderText("напр. ctrl+shift+space")
+        self._hk_pause.setPlaceholderText("Отключено")
         form.addRow("Горячая клавиша — пауза:", self._hk_pause)
 
         self._hk_copy = QLineEdit()
-        self._hk_copy.setPlaceholderText("напр. ctrl+shift+c")
+        self._hk_copy.setPlaceholderText("Отключено")
         form.addRow("Горячая клавиша — скопировать перевод:", self._hk_copy)
 
         self._hk_fullscreen = QLineEdit()
-        self._hk_fullscreen.setPlaceholderText("напр. ctrl+shift+f")
+        self._hk_fullscreen.setPlaceholderText("Отключено")
         form.addRow("Горячая клавиша — перевести весь экран:", self._hk_fullscreen)
 
         self._interval = QSpinBox()
@@ -174,7 +183,7 @@ class SettingsDialog(QDialog):
         dir_row = QHBoxLayout()
         self._models_dir = QLineEdit()
         self._models_dir.setPlaceholderText(str(models.default_models_dir()))
-        self._models_dir.editingFinished.connect(self._on_models_dir_changed)
+        self._models_dir.editingFinished.connect(self._refresh_local_status)
         dir_row.addWidget(self._models_dir)
         browse = QPushButton("Обзор…")
         browse.clicked.connect(self._browse_models_dir)
@@ -214,22 +223,24 @@ class SettingsDialog(QDialog):
     def _required_components(self) -> list:
         """Компоненты, нужные выбранному локальному провайдеру (все, включая
         уже установленные). Для сетевых провайдеров — пусто."""
+        path = self._models_dir.text().strip()
+        root = Path(path) if path else models.default_models_dir()
         provider = self._selected_provider()
         if provider == "local_fast":
             src = self._source_lang.currentData() or "auto"
             tgt = self._target_lang.currentData() or "ru"
             if src == "auto":
                 src = "en" if tgt != "en" else "ru"
-            if local_mt.route(src, tgt) is not None:
+            if local_mt.route(src, tgt, root) is not None:
                 return []  # прямая модель или обе половины через английский
-            return [models.opus_model(src, tgt)]
+            return [models.opus_model(src, tgt, root)]
         if provider == "local_llm":
             device = self._llm_device.currentData() or "auto"
             variants = hardware.llm_variants(device, self._gpu_info)
-            comps = [models.llm_model(), models.llama_runtime(variants[0])]
+            comps = [models.llm_model(root), models.llama_runtime(variants[0], root)]
             if variants[0] != "cpu":
                 # запасной вариант на случай, если GPU-сборка не запустится
-                comps.append(models.llama_runtime("cpu"))
+                comps.append(models.llama_runtime("cpu", root))
             return comps
         return []
 
@@ -255,35 +266,18 @@ class SettingsDialog(QDialog):
         self._download_btn.setText(f"Скачать ({models.format_size(size)})")
         self._download_btn.setVisible(True)
 
-    def _apply_models_dir(self) -> None:
-        tmp = configparser.ConfigParser()
-        tmp["local"] = {"models_dir": self._models_dir.text().strip()}
-        models.configure(tmp)
-
-    def _on_models_dir_changed(self) -> None:
-        self._apply_models_dir()
-        self._refresh_local_status()
-
     def _browse_models_dir(self) -> None:
         start = self._models_dir.text().strip() or str(models.default_models_dir())
         chosen = QFileDialog.getExistingDirectory(self, "Папка для моделей", start)
         if chosen:
             self._models_dir.setText(chosen.replace("/", "\\"))
-            self._on_models_dir_changed()
+            self._refresh_local_status()
 
     def _download_local(self) -> bool:
         from ui.download_dialog import download_components
-        self._apply_models_dir()
         ok = download_components(self, self._required_components())
         self._refresh_local_status()
         return ok
-
-    def reject(self) -> None:
-        # Отмена: вернуть каталог моделей, действовавший до открытия диалога
-        tmp = configparser.ConfigParser()
-        tmp["local"] = {"models_dir": self._orig_models_dir}
-        models.configure(tmp)
-        super().reject()
 
     def _build_tab_ocr(self) -> QWidget:
         w = QWidget()
@@ -373,13 +367,13 @@ class SettingsDialog(QDialog):
     # -------- state --------
     def _load_values(self) -> None:
         c = self._config
-        self._hk_select.setText(c.get("general", "hotkey_select", fallback="ctrl+shift+t"))
-        self._hk_toggle.setText(c.get("general", "hotkey_toggle", fallback="ctrl+shift+p"))
+        self._hk_select.setText(c.get("general", "hotkey_select", fallback=HOTKEY_DEFAULTS["hotkey_select"]))
+        self._hk_toggle.setText(c.get("general", "hotkey_toggle", fallback=HOTKEY_DEFAULTS["hotkey_toggle"]))
         self._hk_pause.setText(
-            c.get("general", "hotkey_pause", fallback="ctrl+shift+space"))
-        self._hk_copy.setText(c.get("general", "hotkey_copy", fallback="ctrl+shift+c"))
+            c.get("general", "hotkey_pause", fallback=HOTKEY_DEFAULTS["hotkey_pause"]))
+        self._hk_copy.setText(c.get("general", "hotkey_copy", fallback=HOTKEY_DEFAULTS["hotkey_copy"]))
         self._hk_fullscreen.setText(
-            c.get("general", "hotkey_fullscreen", fallback="ctrl+shift+f"))
+            c.get("general", "hotkey_fullscreen", fallback=HOTKEY_DEFAULTS["hotkey_fullscreen"]))
         self._interval.setValue(c.getint("general", "capture_interval_ms", fallback=1500))
 
         src = c.get("languages", "source_lang", fallback="auto")
@@ -423,8 +417,27 @@ class SettingsDialog(QDialog):
                 return
 
     def _save(self) -> None:
+        used = set()
+        for field in (self._hk_select, self._hk_toggle, self._hk_pause, self._hk_copy, self._hk_fullscreen):
+            value = field.text().strip()
+            if not value:
+                continue
+            try:
+                combo = parse_hotkey(value)
+                if combo in used:
+                    raise ValueError("это сочетание назначено нескольким действиям")
+                used.add(combo)
+            except ValueError as exc:
+                self._tabs.setCurrentIndex(0)
+                field.setFocus()
+                QMessageBox.warning(self, "Горячие клавиши", f"{value}: {exc}")
+                return
+        if self._selected_provider() == "deepl" and not self._deepl_key.text().strip():
+            self._tabs.setCurrentIndex(2)
+            self._deepl_key.setFocus()
+            QMessageBox.warning(self, "DeepL", "Введите ключ DeepL или выберите другой переводчик.")
+            return
         # Локальный провайдер без моделей: предлагаем скачать сейчас.
-        self._apply_models_dir()
         missing = [x for x in self._required_components() if not x.is_installed()]
         if missing:
             size = models.format_size(sum(x.size for x in missing))
@@ -454,8 +467,8 @@ class SettingsDialog(QDialog):
         if not c.has_section("local"):
             c.add_section("local")
         c["local"]["llm_device"] = self._llm_device.currentData() or "auto"
-        c["local"]["models_dir"] = self._models_dir.text().strip()
-        c["translation"]["deepl_api_key"] = self._deepl_key.text().strip()
+        c["local"]["models_dir"] = self._models_dir.text().strip().replace("%", "%%")
+        c["translation"]["deepl_api_key"] = self._deepl_key.text().strip().replace("%", "%%")
 
         if not c.has_section("ocr"):
             c.add_section("ocr")
@@ -479,10 +492,16 @@ class SettingsDialog(QDialog):
         try:
             user_data_dir()  # гарантируем существование %APPDATA%\TranslateX
             cfg_path = config_path()
-            with open(cfg_path, "w", encoding="utf-8") as f:
-                c.write(f)
-        except Exception as e:
+            contents = io.StringIO()
+            c.write(contents)
+            data = contents.getvalue().encode("utf-8")
+            f = QSaveFile(str(cfg_path))
+            if not f.open(QIODevice.WriteOnly) or f.write(data) != len(data) or not f.commit():
+                raise OSError(f.errorString())
+        except (OSError, ValueError, configparser.Error) as e:
             logger.warning(f"Не удалось сохранить config.ini: {e}")
+            QMessageBox.warning(self, "Настройки не сохранены", str(e))
+            return
 
         self.settings_saved.emit(c)
         self.accept()

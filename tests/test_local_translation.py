@@ -239,7 +239,7 @@ def fake_pairs(monkeypatch):
     monkeypatch.setattr(local_mt, "_model", lambda a, b: _FakePair(a, b))
     monkeypatch.setattr(
         local_mt.models, "opus_model",
-        lambda a, b: SimpleNamespace(is_installed=lambda: (a, b) in installed))
+        lambda a, b, root=None: SimpleNamespace(is_installed=lambda: (a, b) in installed))
     return installed
 
 

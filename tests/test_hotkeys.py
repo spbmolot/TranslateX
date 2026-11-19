@@ -46,9 +46,9 @@ def test_parse_invalid(text):
 
 
 def test_default_hotkeys_parse():
-    for hk in ("ctrl+shift+t", "ctrl+shift+p", "ctrl+shift+space",
-               "ctrl+shift+c", "ctrl+shift+f"):
-        parse_hotkey(hk)
+    from core.shortcuts import HOTKEY_DEFAULTS
+    assert [parse_hotkey(hk) for hk in HOTKEY_DEFAULTS.values() if hk] == [
+        (MOD_CONTROL | MOD_ALT, 0x77)]  # F8
 
 
 # Редкое сочетание, чтобы не пересечься с запущенными программами
@@ -75,12 +75,36 @@ def test_register_all_reports_problems_but_registers_rest(qapp):
     try:
         problems = hk.register_all([
             ("Хорошее", _RARE, lambda: None),
+            ("Отключено", "", lambda: None),
             ("Плохое", "ctrl+banana", lambda: None),
         ])
         assert len(problems) == 1 and problems[0].startswith("Плохое")
         assert len(hk._callbacks) == 1
     finally:
         hk.close()
+
+
+def test_second_process_requests_activation_without_any_hotkeys(qapp, monkeypatch):
+    import subprocess
+    import uuid
+    from utils import hotkeys
+
+    title = f"TranslateX.test.{uuid.uuid4().hex}"
+    monkeypatch.setattr(hotkeys, "ACTIVATION_TITLE", title)
+    restored = []
+    receiver = GlobalHotkeys(on_activate=lambda: restored.append(True))
+    try:
+        subprocess.run([sys.executable, "-c",
+                        "from utils import win32_utils as w; import sys; "
+                        "w.ACTIVATION_TITLE=sys.argv[1]; sys.exit(not w.request_existing_frame())",
+                        title], check=True, timeout=10)
+        for _ in range(20):
+            qapp.processEvents()
+            if restored:
+                break
+        assert restored == [True]
+    finally:
+        receiver.close()
 
 
 def test_wm_hotkey_invokes_callback(qapp):

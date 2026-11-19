@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import threading
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from core import models
@@ -86,14 +87,14 @@ _lock = threading.Lock()
 _loaded: Dict[Tuple[str, str], _PairModel] = {}
 
 
-def route(src: str, tgt: str) -> Optional[List[Tuple[str, str]]]:
+def route(src: str, tgt: str, root: Optional[Path] = None) -> Optional[List[Tuple[str, str]]]:
     """Маршрут перевода по УСТАНОВЛЕННЫМ моделям: прямая пара или через
     английский. None — нужных моделей нет."""
-    if models.opus_model(src, tgt).is_installed():
+    if models.opus_model(src, tgt, root).is_installed():
         return [(src, tgt)]
     if src != "en" and tgt != "en" and (
-        models.opus_model(src, "en").is_installed()
-        and models.opus_model("en", tgt).is_installed()
+        models.opus_model(src, "en", root).is_installed()
+        and models.opus_model("en", tgt, root).is_installed()
     ):
         return [(src, "en"), ("en", tgt)]
     return None
