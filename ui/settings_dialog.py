@@ -3,16 +3,22 @@
 Вкладки: Общее · Языки · Перевод · OCR · Отображение.
 """
 import configparser
+import copy
+import io
 import logging
+from pathlib import Path
 
-from PyQt5.QtCore import pyqtSignal
+from PyQt5.QtCore import QIODevice, QSaveFile, QSize, pyqtSignal
 from PyQt5.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
-    QFormLayout, QHBoxLayout, QLabel, QLineEdit, QRadioButton, QSpinBox,
-    QTabWidget, QVBoxLayout, QWidget,
+    QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+    QMessageBox, QPushButton, QRadioButton, QScrollArea, QSpinBox, QTabWidget,
+    QVBoxLayout, QWidget,
 )
 
+from core import hardware, local_mt, models
 from core.__version__ import __version__
+from core.shortcuts import HOTKEY_DEFAULTS, parse_hotkey
 from core.paths import config_path, user_data_dir
 
 logger = logging.getLogger(__name__)
@@ -44,22 +50,31 @@ class SettingsDialog(QDialog):
 
     def __init__(self, config: configparser.ConfigParser, parent=None):
         super().__init__(parent)
-        self._config = config
+        self._config = copy.deepcopy(config)
+        self._gpu_info = hardware.detect_gpu()
         self.setWindowTitle(f"TranslateX v{__version__} — Настройки")
-        self.setMinimumWidth(480)
-        self.setMinimumHeight(420)
         self._build_ui()
         self._load_values()
+        # On a scaled laptop screen the tabs can scroll while Save stays visible.
+        available = self.screen().availableGeometry().size() - QSize(32, 64)
+        self.resize(self.sizeHint().expandedTo(QSize(520, 460)).boundedTo(available))
 
     # -------- UI --------
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
         self._tabs = QTabWidget()
-        self._tabs.addTab(self._build_tab_general(), "Общее")
-        self._tabs.addTab(self._build_tab_languages(), "Языки")
-        self._tabs.addTab(self._build_tab_provider(), "Перевод")
-        self._tabs.addTab(self._build_tab_ocr(), "OCR")
-        self._tabs.addTab(self._build_tab_overlay(), "Отображение")
+        for page, title in (
+            (self._build_tab_general(), "Общее"),
+            (self._build_tab_languages(), "Языки"),
+            (self._build_tab_provider(), "Перевод"),
+            (self._build_tab_ocr(), "OCR"),
+            (self._build_tab_overlay(), "Отображение"),
+        ):
+            scroll = QScrollArea()
+            scroll.setFrameShape(QFrame.NoFrame)
+            scroll.setWidgetResizable(True)
+            scroll.setWidget(page)
+            self._tabs.addTab(scroll, title)
         root.addWidget(self._tabs)
 
         buttons = QDialogButtonBox()
@@ -74,19 +89,23 @@ class SettingsDialog(QDialog):
         form = QFormLayout(w)
 
         self._hk_select = QLineEdit()
-        self._hk_select.setPlaceholderText("напр. ctrl+shift+t")
+        self._hk_select.setPlaceholderText("Отключено")
         form.addRow("Горячая клавиша — выбор области:", self._hk_select)
 
         self._hk_toggle = QLineEdit()
-        self._hk_toggle.setPlaceholderText("напр. ctrl+shift+p")
+        self._hk_toggle.setPlaceholderText("Отключено")
         form.addRow("Горячая клавиша — вкл/выкл перевод:", self._hk_toggle)
 
+        self._hk_pause = QLineEdit()
+        self._hk_pause.setPlaceholderText("Отключено")
+        form.addRow("Горячая клавиша — пауза:", self._hk_pause)
+
         self._hk_copy = QLineEdit()
-        self._hk_copy.setPlaceholderText("напр. ctrl+shift+c")
+        self._hk_copy.setPlaceholderText("Отключено")
         form.addRow("Горячая клавиша — скопировать перевод:", self._hk_copy)
 
         self._hk_fullscreen = QLineEdit()
-        self._hk_fullscreen.setPlaceholderText("напр. ctrl+shift+f")
+        self._hk_fullscreen.setPlaceholderText("Отключено")
         form.addRow("Горячая клавиша — перевести весь экран:", self._hk_fullscreen)
 
         self._interval = QSpinBox()
@@ -128,10 +147,16 @@ class SettingsDialog(QDialog):
         w = QWidget()
         v = QVBoxLayout(w)
 
-        self._radio_google = QRadioButton("Google Translate (бесплатно, без ключа)")
-        self._radio_deepl = QRadioButton("DeepL API (лучшее качество)")
-        v.addWidget(self._radio_google)
-        v.addWidget(self._radio_deepl)
+        self._radio_google = QRadioButton("Google Translate (интернет, бесплатно, без ключа)")
+        self._radio_deepl = QRadioButton("DeepL API (интернет, нужен ключ)")
+        self._radio_local_fast = QRadioButton(
+            "Локально: быстрая модель (без интернета, процессор, мгновенно)")
+        self._radio_local_llm = QRadioButton(
+            "Локально: нейросеть TranslateGemma (без интернета, лучшее качество)")
+        for radio in (self._radio_google, self._radio_deepl,
+                      self._radio_local_fast, self._radio_local_llm):
+            v.addWidget(radio)
+            radio.toggled.connect(self._refresh_local_status)
 
         row = QHBoxLayout()
         row.addWidget(QLabel("Ключ DeepL API:"))
@@ -140,8 +165,119 @@ class SettingsDialog(QDialog):
         self._deepl_key.setPlaceholderText("Вставьте ваш API-ключ DeepL")
         row.addWidget(self._deepl_key)
         v.addLayout(row)
+
+        box = QGroupBox("Локальные модели")
+        form = QFormLayout(box)
+
+        self._llm_device = QComboBox()
+        self._llm_device.addItem("Авто (видеокарта, если подходит)", "auto")
+        self._llm_device.addItem("Видеокарта", "gpu")
+        self._llm_device.addItem("Процессор", "cpu")
+        self._llm_device.currentIndexChanged.connect(self._refresh_local_status)
+        form.addRow("Нейросеть считать на:", self._llm_device)
+
+        gpu_label = QLabel(f"<small>Обнаружено: {hardware.describe(self._gpu_info)}</small>")
+        gpu_label.setWordWrap(True)
+        form.addRow("", gpu_label)
+
+        dir_row = QHBoxLayout()
+        self._models_dir = QLineEdit()
+        self._models_dir.setPlaceholderText(str(models.default_models_dir()))
+        self._models_dir.editingFinished.connect(self._refresh_local_status)
+        dir_row.addWidget(self._models_dir)
+        browse = QPushButton("Обзор…")
+        browse.clicked.connect(self._browse_models_dir)
+        dir_row.addWidget(browse)
+        form.addRow("Папка моделей:", dir_row)
+
+        self._local_status = QLabel()
+        self._local_status.setWordWrap(True)
+        form.addRow(self._local_status)
+
+        self._download_btn = QPushButton("Скачать")
+        self._download_btn.clicked.connect(self._download_local)
+        form.addRow(self._download_btn)
+        v.addWidget(box)
+
+        hint = (
+            "нейросеть TranslateGemma — видеокарта подходит"
+            if self._gpu_info is not None and self._gpu_info.usable
+            else "быстрая модель — нейросеть без видеокарты переводит экран до минуты"
+        )
+        note = QLabel(f"<small><i>Для этого компьютера из локальных лучше: {hint}.</i></small>")
+        note.setWordWrap(True)
+        v.addWidget(note)
         v.addStretch(1)
         return w
+
+    # -------- локальные модели --------
+    def _selected_provider(self) -> str:
+        if self._radio_deepl.isChecked():
+            return "deepl"
+        if self._radio_local_fast.isChecked():
+            return "local_fast"
+        if self._radio_local_llm.isChecked():
+            return "local_llm"
+        return "google"
+
+    def _required_components(self) -> list:
+        """Компоненты, нужные выбранному локальному провайдеру (все, включая
+        уже установленные). Для сетевых провайдеров — пусто."""
+        path = self._models_dir.text().strip()
+        root = Path(path) if path else models.default_models_dir()
+        provider = self._selected_provider()
+        if provider == "local_fast":
+            src = self._source_lang.currentData() or "auto"
+            tgt = self._target_lang.currentData() or "ru"
+            if src == "auto":
+                src = "en" if tgt != "en" else "ru"
+            if local_mt.route(src, tgt, root) is not None:
+                return []  # прямая модель или обе половины через английский
+            return [models.opus_model(src, tgt, root)]
+        if provider == "local_llm":
+            device = self._llm_device.currentData() or "auto"
+            variants = hardware.llm_variants(device, self._gpu_info)
+            comps = [models.llm_model(root), models.llama_runtime(variants[0], root)]
+            if variants[0] != "cpu":
+                # запасной вариант на случай, если GPU-сборка не запустится
+                comps.append(models.llama_runtime("cpu", root))
+            return comps
+        return []
+
+    def _refresh_local_status(self, *_args) -> None:
+        if not hasattr(self, "_local_status") or not hasattr(self, "_target_lang"):
+            return
+        provider = self._selected_provider()
+        self._llm_device.setEnabled(provider == "local_llm")
+        if provider not in ("local_fast", "local_llm"):
+            self._local_status.setText(
+                "<small>Выберите локальный вариант, чтобы переводить без "
+                "интернета — текст с экрана не будет покидать компьютер.</small>")
+            self._download_btn.setVisible(False)
+            return
+        missing = [c for c in self._required_components() if not c.is_installed()]
+        if not missing:
+            self._local_status.setText("✔ Всё установлено, можно пользоваться.")
+            self._download_btn.setVisible(False)
+            return
+        size = sum(c.size for c in missing)
+        names = ", ".join(c.title for c in missing)
+        self._local_status.setText(f"Нужно скачать: {names}.")
+        self._download_btn.setText(f"Скачать ({models.format_size(size)})")
+        self._download_btn.setVisible(True)
+
+    def _browse_models_dir(self) -> None:
+        start = self._models_dir.text().strip() or str(models.default_models_dir())
+        chosen = QFileDialog.getExistingDirectory(self, "Папка для моделей", start)
+        if chosen:
+            self._models_dir.setText(chosen.replace("/", "\\"))
+            self._refresh_local_status()
+
+    def _download_local(self) -> bool:
+        from ui.download_dialog import download_components
+        ok = download_components(self, self._required_components())
+        self._refresh_local_status()
+        return ok
 
     def _build_tab_ocr(self) -> QWidget:
         w = QWidget()
@@ -231,11 +367,13 @@ class SettingsDialog(QDialog):
     # -------- state --------
     def _load_values(self) -> None:
         c = self._config
-        self._hk_select.setText(c.get("general", "hotkey_select", fallback="ctrl+shift+t"))
-        self._hk_toggle.setText(c.get("general", "hotkey_toggle", fallback="ctrl+shift+p"))
-        self._hk_copy.setText(c.get("general", "hotkey_copy", fallback="ctrl+shift+c"))
+        self._hk_select.setText(c.get("general", "hotkey_select", fallback=HOTKEY_DEFAULTS["hotkey_select"]))
+        self._hk_toggle.setText(c.get("general", "hotkey_toggle", fallback=HOTKEY_DEFAULTS["hotkey_toggle"]))
+        self._hk_pause.setText(
+            c.get("general", "hotkey_pause", fallback=HOTKEY_DEFAULTS["hotkey_pause"]))
+        self._hk_copy.setText(c.get("general", "hotkey_copy", fallback=HOTKEY_DEFAULTS["hotkey_copy"]))
         self._hk_fullscreen.setText(
-            c.get("general", "hotkey_fullscreen", fallback="ctrl+shift+f"))
+            c.get("general", "hotkey_fullscreen", fallback=HOTKEY_DEFAULTS["hotkey_fullscreen"]))
         self._interval.setValue(c.getint("general", "capture_interval_ms", fallback=1500))
 
         src = c.get("languages", "source_lang", fallback="auto")
@@ -244,10 +382,15 @@ class SettingsDialog(QDialog):
         self._select_combo(self._target_lang, tgt)
 
         provider = c.get("translation", "provider", fallback="google")
-        if provider == "deepl":
-            self._radio_deepl.setChecked(True)
-        else:
-            self._radio_google.setChecked(True)
+        {"deepl": self._radio_deepl, "local_fast": self._radio_local_fast,
+         "local_llm": self._radio_local_llm}.get(
+            provider, self._radio_google).setChecked(True)
+        self._select_combo(
+            self._llm_device, c.get("local", "llm_device", fallback="auto"))
+        self._models_dir.setText(c.get("local", "models_dir", fallback=""))
+        self._source_lang.currentIndexChanged.connect(self._refresh_local_status)
+        self._target_lang.currentIndexChanged.connect(self._refresh_local_status)
+        self._refresh_local_status()
         self._deepl_key.setText(c.get("translation", "deepl_api_key", fallback=""))
 
         self._select_combo(self._backend, c.get("ocr", "backend", fallback="easyocr"))
@@ -274,9 +417,45 @@ class SettingsDialog(QDialog):
                 return
 
     def _save(self) -> None:
+        used = set()
+        for field in (self._hk_select, self._hk_toggle, self._hk_pause, self._hk_copy, self._hk_fullscreen):
+            value = field.text().strip()
+            if not value:
+                continue
+            try:
+                combo = parse_hotkey(value)
+                if combo in used:
+                    raise ValueError("это сочетание назначено нескольким действиям")
+                used.add(combo)
+            except ValueError as exc:
+                self._tabs.setCurrentIndex(0)
+                field.setFocus()
+                QMessageBox.warning(self, "Горячие клавиши", f"{value}: {exc}")
+                return
+        if self._selected_provider() == "deepl" and not self._deepl_key.text().strip():
+            self._tabs.setCurrentIndex(2)
+            self._deepl_key.setFocus()
+            QMessageBox.warning(self, "DeepL", "Введите ключ DeepL или выберите другой переводчик.")
+            return
+        # Локальный провайдер без моделей: предлагаем скачать сейчас.
+        missing = [x for x in self._required_components() if not x.is_installed()]
+        if missing:
+            size = models.format_size(sum(x.size for x in missing))
+            answer = QMessageBox.question(
+                self, "TranslateX",
+                f"Для выбранного способа перевода нужно скачать модели ({size}).\n"
+                "Скачать сейчас?",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                QMessageBox.Yes)
+            if answer == QMessageBox.Cancel:
+                return
+            if answer == QMessageBox.Yes and not self._download_local():
+                return  # не скачалось — остаёмся в настройках
+
         c = self._config
         c["general"]["hotkey_select"] = self._hk_select.text().strip()
         c["general"]["hotkey_toggle"] = self._hk_toggle.text().strip()
+        c["general"]["hotkey_pause"] = self._hk_pause.text().strip()
         c["general"]["hotkey_copy"] = self._hk_copy.text().strip()
         c["general"]["hotkey_fullscreen"] = self._hk_fullscreen.text().strip()
         c["general"]["capture_interval_ms"] = str(self._interval.value())
@@ -284,8 +463,12 @@ class SettingsDialog(QDialog):
         c["languages"]["source_lang"] = self._source_lang.currentData()
         c["languages"]["target_lang"] = self._target_lang.currentData()
 
-        c["translation"]["provider"] = "deepl" if self._radio_deepl.isChecked() else "google"
-        c["translation"]["deepl_api_key"] = self._deepl_key.text().strip()
+        c["translation"]["provider"] = self._selected_provider()
+        if not c.has_section("local"):
+            c.add_section("local")
+        c["local"]["llm_device"] = self._llm_device.currentData() or "auto"
+        c["local"]["models_dir"] = self._models_dir.text().strip().replace("%", "%%")
+        c["translation"]["deepl_api_key"] = self._deepl_key.text().strip().replace("%", "%%")
 
         if not c.has_section("ocr"):
             c.add_section("ocr")
@@ -309,10 +492,16 @@ class SettingsDialog(QDialog):
         try:
             user_data_dir()  # гарантируем существование %APPDATA%\TranslateX
             cfg_path = config_path()
-            with open(cfg_path, "w", encoding="utf-8") as f:
-                c.write(f)
-        except Exception as e:
+            contents = io.StringIO()
+            c.write(contents)
+            data = contents.getvalue().encode("utf-8")
+            f = QSaveFile(str(cfg_path))
+            if not f.open(QIODevice.WriteOnly) or f.write(data) != len(data) or not f.commit():
+                raise OSError(f.errorString())
+        except (OSError, ValueError, configparser.Error) as e:
             logger.warning(f"Не удалось сохранить config.ini: {e}")
+            QMessageBox.warning(self, "Настройки не сохранены", str(e))
+            return
 
         self.settings_saved.emit(c)
         self.accept()

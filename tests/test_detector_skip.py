@@ -22,7 +22,7 @@ from PyQt5.QtCore import QRect
 from PyQt5.QtWidgets import QApplication
 
 import core.pipeline as pipeline_module
-from core.ocr import OcrJobThread, TextBlock
+from core.ocr import OcrJobThread
 from core.pipeline import AppController
 
 
@@ -105,13 +105,16 @@ def controller(qapp, monkeypatch):
     cfg = configparser.ConfigParser()
     cfg["general"] = {"capture_interval_ms": "500",
                       "cache_ttl_seconds": "3600", "cache_max_size": "100"}
-    cfg["languages"] = {"source_lang": "auto", "target_lang": "ru"}
+    cfg["languages"] = {"source_lang": "auto", "target_lang": "en"}
     cfg["translation"] = {"provider": "google", "deepl_api_key": ""}
     cfg["overlay"] = {"min_confidence": "0.4"}
     cfg["ocr"] = {"gpu": "false", "detector_skip": "true"}
     c = AppController(cfg)
+    c.set_region(QRect(0, 0, 400, 200))
+    c.start()
     yield c
-    c._timer.stop()
+    c.stop()
+    c._autosave_timer.stop()
 
 
 def test_policy_two_skips_then_full_detect(controller):
@@ -129,22 +132,37 @@ def test_policy_disabled_by_config(controller):
     assert controller._next_cached_boxes() is None
 
 
+def _capture_job(controller, reader):
+    image = np.zeros((200, 400, 3), dtype=np.uint8)
+    job = OcrJobThread(reader=reader, image=image, min_confidence=0.4,
+                       downscale="off", cached_boxes=controller._next_cached_boxes())
+    controller._ocr_busy = True
+    controller._ocr_generation = controller._region_generation
+    job.ocr_complete.connect(controller._on_ocr_complete)
+    return job
+
+
 def test_weak_recognize_only_result_invalidates_cache(controller):
     controller._last_det_boxes = ([[1, 2, 3, 4]], [])
-    fake_job = MagicMock()
-    fake_job.last_boxes = None
-    fake_job.used_cached_boxes = True
-    controller.sender = lambda: fake_job
-    controller._active = False  # ранний выход после учёта боксов
-    controller._on_ocr_complete([])  # пустой результат → кэш сброшен
+    reader = _SplitReader()
+    reader.recognize = MagicMock(return_value=[])
+    _capture_job(controller, reader).run()
+    assert reader.detect_calls == 0
+    reader.recognize.assert_called_once()
     assert controller._last_det_boxes is None
 
 
 def test_full_detect_result_updates_cache(controller):
-    fake_job = MagicMock()
-    fake_job.last_boxes = ([[5, 6, 7, 8]], [])
-    fake_job.used_cached_boxes = False
-    controller.sender = lambda: fake_job
-    controller._active = False
-    controller._on_ocr_complete([])
-    assert controller._last_det_boxes == ([[5, 6, 7, 8]], [])
+    reader = _SplitReader()
+    _capture_job(controller, reader).run()
+    assert reader.detect_calls == 1
+    assert controller._last_det_boxes == ([[10, 200, 10, 40]], [])
+
+
+def test_late_full_detect_after_stop_does_not_repopulate_cache(controller):
+    job = _capture_job(controller, _SplitReader())
+    controller.stop()
+    job.run()
+    assert job.last_boxes == ([[10, 200, 10, 40]], [])
+    assert controller._last_det_boxes is None
+    assert not controller._timer.isActive()

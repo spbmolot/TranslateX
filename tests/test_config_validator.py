@@ -89,18 +89,30 @@ def test_unknown_target_lang_replaced():
     assert c.get("languages", "target_lang") == "ru"
 
 
-def test_empty_hotkey_replaced():
+def test_empty_hotkey_stays_disabled():
     c = _make_config({"general": {"hotkey_select": "   "}})
     issues = validate_and_fix(c)
-    assert any("hotkey_select" in m.lower() or "выбор области" in m.lower() for m in issues)
-    assert c.get("general", "hotkey_select") == "ctrl+shift+t"
+    assert not issues
+    assert c.get("general", "hotkey_select") == ""
 
 
 def test_invalid_hotkey_pattern_replaced():
     c = _make_config({"general": {"hotkey_pause": "ctrl+@#$"}})
     issues = validate_and_fix(c)
     assert any("пауза" in m.lower() or "hotkey_pause" in m.lower() for m in issues)
-    assert c.get("general", "hotkey_pause") == "ctrl+shift+space"
+    assert c.get("general", "hotkey_pause") == ""
+
+
+def test_migration_of_partial_legacy_config_preserves_custom_shortcuts():
+    from core.shortcuts import HOTKEY_DEFAULTS, migrate_hotkeys
+    c = configparser.ConfigParser()
+    c.read_dict({"general": {"hotkey_select": "ctrl+shift+t", "hotkey_toggle": "F10"}})
+    migrate_hotkeys(c)
+    assert c["general"]["hotkey_select"] == HOTKEY_DEFAULTS["hotkey_select"]
+    assert c["general"]["hotkey_toggle"] == "F10"
+    c["general"]["hotkey_select"] = "ctrl+shift+t"  # explicitly set in the new UI
+    migrate_hotkeys(c)
+    assert c["general"]["hotkey_select"] == "ctrl+shift+t"
 
 
 def test_invalid_hex_color_replaced():

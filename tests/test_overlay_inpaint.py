@@ -43,13 +43,19 @@ def _render(ov) -> "QImage":
     return img
 
 
+def _color_at(img, x, y):
+    # QWidget geometry is in DIPs; QImage addresses the backing store's pixels.
+    scale = img.devicePixelRatio()
+    return img.pixelColor(round(x * scale), round(y * scale))
+
+
 def test_inpaint_fills_bbox_with_sampled_color():
     ov = _make_overlay("inpaint")
     ov._blocks = [_block((200, 30, 30))]  # тёмно-красный фон
     ov._region = QRect(0, 0, 400, 200)
     img = _render(ov)
     # Угол bbox (не текст): должен быть залит красным
-    c = img.pixelColor(374, 24)
+    c = _color_at(img, 374, 24)
     assert abs(c.red() - 200) <= 40 and c.green() <= 80 and c.blue() <= 80, \
         f"ожидалась красная заливка, получено RGB({c.red()},{c.green()},{c.blue()})"
 
@@ -68,7 +74,7 @@ def test_inpaint_draws_contrast_text():
     light = 0
     for x in range(25, 375, 3):
         for y in range(22, 58, 2):
-            c = img.pixelColor(x, y)
+            c = _color_at(img, x, y)
             if c.red() > 200 and c.green() > 200 and c.blue() > 200:
                 light += 1
     assert light > 10, "белые пиксели текста не найдены внутри bbox"
@@ -81,7 +87,7 @@ def test_block_without_bg_translucent_falls_back_to_outline():
     ov._region = QRect(0, 0, 400, 200)
     img = _render(ov)
     # Угол bbox — прозрачный (нет заливки при opacity=0.0)
-    c = img.pixelColor(374, 24)
+    c = _color_at(img, 374, 24)
     assert c.alpha() < 40, f"ожидалась прозрачность, alpha={c.alpha()}"
 
 
@@ -92,7 +98,7 @@ def test_block_without_bg_opaque_draws_solid_plate():
     ov._blocks = [_block(None)]
     ov._region = QRect(0, 0, 400, 200)
     img = _render(ov)
-    c = img.pixelColor(374, 24)
+    c = _color_at(img, 374, 24)
     assert c.alpha() > 200
     assert c.red() < 60 and c.blue() < 80, \
         f"ожидалась тёмная плашка, RGB({c.red()},{c.green()},{c.blue()})"
@@ -103,7 +109,7 @@ def test_outline_style_ignores_bg_rgb():
     ov._blocks = [_block((200, 30, 30))]
     ov._region = QRect(0, 0, 400, 200)
     img = _render(ov)
-    c = img.pixelColor(374, 24)
+    c = _color_at(img, 374, 24)
     # outline + opacity 0 → без красной заливки
     assert not (abs(c.red() - 200) <= 40 and c.green() <= 80), \
         "outline-режим не должен рисовать inpaint-заливку"
@@ -119,3 +125,27 @@ def test_opaque_mode_sets_window_mask():
     br = mask.boundingRect()
     assert (br.x(), br.y(), br.width(), br.height()) == (20, 20, 360, 40)
     ov.hide_overlay()
+
+
+def test_overlay_aligns_to_native_capture_on_windows():
+    if _app.platformName() != "windows":
+        pytest.skip("requires a Windows HWND")
+    from utils.win32_utils import window_client_rect
+
+    ov = _make_overlay("inpaint")
+    # The capture frame and overlay may have different logical sizes when
+    # their primary monitors differ. The physical capture is authoritative.
+    native = QRect(30, 40, 600, 300)
+    ov.update_blocks([_block((150, 30, 30))], QRect(10, 20, 400, 200),
+                     _app.primaryScreen(), native)
+    _app.processEvents()
+    try:
+        assert window_client_rect(int(ov.winId())) == native.getRect()
+        ratio = ov.devicePixelRatioF()
+        mask = ov.mask().boundingRect()
+        actual = tuple(round(v * ratio) for v in mask.getRect())
+        assert actual == pytest.approx((30, 30, 540, 60), abs=2)
+        img = _render(ov)
+        assert img.pixelColor(558, 36).red() >= 130
+    finally:
+        ov.hide_overlay()
