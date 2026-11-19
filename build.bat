@@ -1,5 +1,6 @@
 @echo off
 setlocal EnableDelayedExpansion
+cd /d "%~dp0"
 title TranslateX Build Pipeline
 
 echo.
@@ -57,21 +58,17 @@ if %errorlevel% neq 0 (
     pip install -q pyinstaller
 )
 
-:: Clean previous build
-if exist "dist\TranslateX" (
-    echo [INFO] Removing old dist\TranslateX...
-    rmdir /s /q "dist\TranslateX"
-)
-if exist "build" (
-    rmdir /s /q "build"
-)
-
-pyinstaller build.spec --noconfirm
+python -m PyInstaller build.spec --noconfirm
 if %errorlevel% neq 0 (
     echo [ERROR] PyInstaller build failed. Check output above.
     goto :fail
 )
 echo [OK] Executable built: dist\TranslateX\TranslateX.exe
+python -m zipfile -c "dist\TranslateX.new.zip" "dist\TranslateX"
+if errorlevel 1 goto :fail
+move /y "dist\TranslateX.new.zip" "dist\TranslateX.zip" >nul
+if errorlevel 1 goto :fail
+echo [OK] Portable ZIP built: dist\TranslateX.zip
 
 :: ── Step 4: Inno Setup ───────────────────────────────────────
 echo.
@@ -124,6 +121,7 @@ echo   BUILD SUCCESSFUL
 echo ============================================================
 echo.
 echo   Portable app:  dist\TranslateX\TranslateX.exe
+echo   Portable ZIP:  dist\TranslateX.zip
 if defined APP_VERSION (
   if exist "installer\Output\TranslateX_Setup_%APP_VERSION%.exe" (
     echo   Installer:     installer\Output\TranslateX_Setup_%APP_VERSION%.exe

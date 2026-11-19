@@ -4,31 +4,35 @@
 ;
 ; Usage:
 ;   ISCC.exe installer\setup.iss
-; Output: installer\Output\TranslateX_Setup_1.0.0.exe
+; Output: installer\Output\TranslateX_Setup_<version>.exe
 ; ============================================================
 
 #define MyAppName        "TranslateX"
 #define MyAppPublisher   "TranslateX"
 ; Path to PyInstaller output (relative to this .iss file).
 ; Note: this is also referenced below by [Files] section.
-#define BuildDir "..\dist\TranslateX"
+#ifndef BuildDir
+  #define BuildDir "..\dist\TranslateX"
+#endif
 ;
 ; Версия берётся из генерируемого version.iss (SSOT — core/__version__.py).
 ; Генерация: `python scripts/sync_version.py` (вызывается из build.bat).
-#if FileExists("version.iss")
-  #include "version.iss"
-#else
-  #pragma warning "version.iss not found — запусти 'python scripts/sync_version.py'. Fallback 0.0.0."
-  #define MyAppVersion "0.0.0"
-#endif
-#define MyAppURL         "https://github.com/your-repo/translatex"
+#include "version.iss"
+#define MyAppURL         "https://github.com/spbmolot/TranslateX"
 #define MyAppExeName     "TranslateX.exe"
 #define MyAppDescription "Real-time screen translation overlay"
+#if GetVersionNumbersString(AddBackslash(BuildDir) + MyAppExeName) != MyAppVersion + ".0"
+  #error The packaged TranslateX.exe does not match installer/version.iss. Run the build again.
+#endif
 
 [Setup]
 AppId={{F3A7B2C1-8D4E-4F9A-B1C2-D3E4F5A6B7C8}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
+VersionInfoVersion={#MyAppVersion}.0
+VersionInfoTextVersion={#MyAppVersion}
+VersionInfoProductVersion={#MyAppVersion}.0
+VersionInfoProductTextVersion={#MyAppVersion}
 AppVerName={#MyAppName} {#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
@@ -53,6 +57,10 @@ WizardStyle=modern
 Compression=lzma2/ultra64
 SolidCompression=yes
 InternalCompressLevel=ultra64
+#ifdef BuildBlockThreads
+LZMANumBlockThreads={#BuildBlockThreads}
+LZMAUseSeparateProcess=yes
+#endif
 
 ; Privileges
 PrivilegesRequired=admin
@@ -77,8 +85,10 @@ UninstallDisplayIcon={app}\{#MyAppExeName}
 UninstallDisplayName={#MyAppName} {#MyAppVersion}
 CreateUninstallRegKey=yes
 
-; Don't close applications
-CloseApplications=no
+; Restart Manager matches the actual file in {app} and requests a normal exit.
+CloseApplications=yes
+CloseApplicationsFilter=TranslateX.exe
+RestartApplications=no
 
 [Languages]
 Name: "english";  MessagesFile: "compiler:Default.isl"
@@ -108,10 +118,6 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 ; Launch after install (optional, skippable)
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
-[UninstallRun]
-; Kill the process before uninstalling if it's running
-Filename: "taskkill.exe"; Parameters: "/F /IM {#MyAppExeName}"; Flags: runhidden skipifdoesntexist; RunOnceId: "KillTranslateX"
-
 [Code]
 // ════════════════════════════════════════════════════════════════════════
 //  Версионирование и качественное обновление
@@ -125,10 +131,7 @@ Filename: "taskkill.exe"; Parameters: "/F /IM {#MyAppExeName}"; Flags: runhidden
 //         • старее          → предложение обновить (X → Y);
 //         • та же версия    → предложение переустановить (восстановить);
 //         • новее           → предупреждение о даунгрейде.
-//    4. Перед копированием закрывает запущенное приложение, а при обновлении
-//       вычищает файлы прошлой версии (onedir = тысячи файлов), чтобы не
-//       осталось «висящих» артефактов. Пользовательские данные в
-//       %APPDATA%\TranslateX НЕ затрагиваются.
+//    4. Перед копированием Restart Manager может закрыть установленную копию.
 // ════════════════════════════════════════════════════════════════════════
 
 const
@@ -197,50 +200,54 @@ begin
   if cmp < 0 then
   begin
     gIsUpgrade := True;
-    if MsgBox('Установлена версия TranslateX ' + gInstalledVersion + '.' + #13#10 +
+    if SuppressibleMsgBox('Установлена версия TranslateX ' + gInstalledVersion + '.' + #13#10 +
               'Обновить до версии {#MyAppVersion}?' + #13#10 + #13#10 +
-              'Ваши настройки и история переводов будут сохранены.',
-              mbConfirmation, MB_YESNO) = IDNO then
+              'Ваши настройки будут сохранены.',
+              mbConfirmation, MB_YESNO, IDYES) = IDNO then
       Result := False;
   end
   else if cmp = 0 then
   begin
     gIsUpgrade := True;
-    if MsgBox('TranslateX версии {#MyAppVersion} уже установлена.' + #13#10 +
+    if SuppressibleMsgBox('TranslateX версии {#MyAppVersion} уже установлена.' + #13#10 +
               'Переустановить (восстановить файлы программы)?',
-              mbConfirmation, MB_YESNO) = IDNO then
+              mbConfirmation, MB_YESNO, IDYES) = IDNO then
       Result := False;
   end
   else
   begin
     gIsUpgrade := True;
-    if MsgBox('Внимание: установлена БОЛЕЕ НОВАЯ версия TranslateX ' +
+    if SuppressibleMsgBox('Внимание: установлена БОЛЕЕ НОВАЯ версия TranslateX ' +
               gInstalledVersion + '.' + #13#10 +
               'Сейчас вы устанавливаете более старую версию {#MyAppVersion} (откат).'
               + #13#10 + #13#10 + 'Продолжить?',
-              mbError, MB_YESNO) = IDNO then
+              mbError, MB_YESNO, IDNO) = IDNO then
       Result := False;
   end;
 end;
 
-// Перед копированием файлов: закрыть запущенный TranslateX и (при обновлении)
-// удалить файлы прошлой версии, чтобы не осталось устаревших артефактов.
-function PrepareToInstall(var NeedsRestart: Boolean): String;
+// Restart Manager is an installer feature. On uninstall let the user exit
+// normally if this installation's executable is still mapped by Windows.
+function InitializeUninstall(): Boolean;
 var
-  ResultCode: Integer;
+  Exe: String;
+  Probe: TFileStream;
 begin
-  Result := '';
-
-  // Завершаем процесс (безвредно, если он не запущен).
-  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM {#MyAppExeName}',
-       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Sleep(800);
-
-  if gIsUpgrade then
-  begin
-    // Чистим только каталог программы; %APPDATA%\TranslateX не трогаем.
-    DelTree(ExpandConstant('{app}\_internal'), True, True, True);
-    DeleteFile(ExpandConstant('{app}\{#MyAppExeName}'));
+  Result := True;
+  Exe := ExpandConstant('{app}\{#MyAppExeName}');
+  while FileExists(Exe) do begin
+    try
+      Probe := TFileStream.Create(Exe, fmOpenReadWrite or fmShareDenyNone);
+      Probe.Free;
+      Exit;
+    except
+      if SuppressibleMsgBox('Файл ' + Exe + ' занят или недоступен.' + #13#10 +
+        'Закройте TranslateX через «Выход» в меню значка возле часов и нажмите «Повторить».',
+        mbError, MB_RETRYCANCEL, IDCANCEL) <> IDRETRY then begin
+        Result := False;
+        Exit;
+      end;
+    end;
   end;
 end;
 
@@ -249,7 +256,7 @@ procedure CurStepChanged(CurStep: TSetupStep);
 var
   head: String;
 begin
-  if CurStep = ssPostInstall then
+  if (CurStep = ssPostInstall) and not WizardSilent then
   begin
     if gIsUpgrade then
       head := 'TranslateX обновлён до версии {#MyAppVersion}!'
@@ -261,9 +268,7 @@ begin
       'Базовые модели распознавания (русский + английский) уже включены в' + #13#10 +
       'комплект — приложение работает сразу, без скачивания.' + #13#10 +
       'Модели для других языков будут загружены при необходимости.' + #13#10 + #13#10 +
-      'Горячие клавиши (настраиваются в Настройках):' + #13#10 +
-      '  Ctrl+Shift+T — выбрать область экрана' + #13#10 +
-      '  Ctrl+Shift+P — включить/выключить перевод',
+      'Посмотреть и изменить горячие клавиши можно в настройках TranslateX.',
       mbInformation,
       MB_OK
     );

@@ -73,7 +73,7 @@ signtool sign `
   /tr  "http://timestamp.digicert.com" `
   /td  SHA256 `
   /d   "TranslateX" `
-  /du  "https://github.com/your-repo/translatex" `
+  /du  "https://github.com/spbmolot/TranslateX" `
   "dist\TranslateX\TranslateX.exe"
 ```
 
@@ -92,7 +92,7 @@ signtool sign `
 ```powershell
 signtool sign /f "..." /p "..." /fd SHA256 /tr "..." /td SHA256 `
   /d "TranslateX Installer" `
-  "installer\Output\TranslateX_Setup_1.0.0.exe"
+  "installer\Output\TranslateX_Setup_1.0.2.exe"
 ```
 
 ### 4.3. Verify

@@ -11,6 +11,12 @@ from pathlib import Path
 
 block_cipher = None
 ROOT = Path(SPECPATH)
+if os.name == "nt":
+    # This path is inherited by isolated analysis processes, not the frozen app.
+    probe_env = str(ROOT / "scripts" / "pyinstaller_env")
+    python_path = os.environ.get("PYTHONPATH")
+    os.environ["PYTHONPATH"] = os.pathsep.join(filter(None, (probe_env, python_path)))
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 # ─── Data files to bundle ───────────────────────────────────────────────────
 added_files = [
