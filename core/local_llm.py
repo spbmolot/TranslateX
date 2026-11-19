@@ -110,6 +110,7 @@ class LlmServer:
 
     def __init__(self):
         self._lock = threading.Lock()
+        self._closing = threading.Event()
         self._proc: Optional[subprocess.Popen] = None
         self._port = 0
         self._device = ""       # с какой настройкой запущен
@@ -147,11 +148,15 @@ class LlmServer:
             cmd, stdout=self._log or subprocess.DEVNULL, stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL, cwd=str(exe.parent),
             creationflags=_NO_WINDOW if os.name == "nt" else 0)
+        self._proc = proc  # also allow shutdown to interrupt model loading
         _kill_with_parent(proc)
 
         import requests
         deadline = time.monotonic() + _START_TIMEOUT_S
         while time.monotonic() < deadline:
+            if self._closing.is_set():
+                proc.kill()
+                raise RuntimeError("Локальный перевод завершает работу")
             if proc.poll() is not None:
                 logger.warning(f"llama-server ({variant}) завершился при запуске, "
                                f"код {proc.returncode}")
@@ -176,6 +181,8 @@ class LlmServer:
         if not models.llm_model().is_installed():
             raise LocalModelMissing("модель LLM не скачана")
         for variant in self._candidates(device):
+            if self._closing.is_set():
+                raise RuntimeError("Локальный перевод завершает работу")
             if self._spawn(variant):
                 self._device = device
                 return
@@ -194,6 +201,8 @@ class LlmServer:
         if src == tgt:
             return text
         with self._lock:
+            if self._closing.is_set():
+                raise RuntimeError("Локальный перевод завершает работу")
             self._ensure(device)
             r = requests.post(
                 f"http://127.0.0.1:{self._port}/completion",
@@ -226,6 +235,13 @@ class LlmServer:
                 pass
             self._log = None
         self.variant = ""
+
+    def begin_shutdown(self) -> None:
+        """Interrupt local inference/startup without waiting on the request lock."""
+        self._closing.set()
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            proc.kill()
 
     def stop(self) -> None:
         """Остановить сервер. Не ждёт идущий запрос: убиваем процесс сразу,

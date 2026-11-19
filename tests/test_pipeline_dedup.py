@@ -12,6 +12,7 @@ import sys
 from unittest.mock import MagicMock
 
 import pytest
+import numpy as np
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -133,3 +134,47 @@ def test_stale_translation_result_dropped(controller):
     controller._on_translation_complete([_translated("x", "y2", 10)])
     assert len(emitted) == 1
     assert controller._last_applied_trans_id == 3
+
+
+def test_scaled_capture_samples_native_pixels_and_emits_logical_boxes(controller, monkeypatch):
+    region = QRect(-1180, 200, 120, 80)
+    native = QRect(-1130, 300, 180, 120)
+    controller.set_region(region, native)
+    image = np.zeros((120, 180, 3), dtype=np.uint8)
+    image[57:79, 87:124] = (60, 90, 120)
+    capture = MagicMock(return_value=image)
+    monkeypatch.setattr(pipeline_module, "capture_to_numpy", capture)
+    monkeypatch.setattr(pipeline_module, "OcrJobThread", MagicMock())
+    controller._ocr_worker = MagicMock()
+    controller._on_timer_tick()
+    capture.assert_called_once_with(-1130, 300, 180, 120)
+
+    controller._last_ocr_signature = ("hello",)
+    controller._last_translated_blocks = [_translated("hello", "привет", 10)]
+    emitted = []
+    controller.translation_ready.connect(lambda blocks, rect: emitted.append((blocks, rect)))
+    native_box = [[90, 60], [120, 60], [120, 75], [90, 75]]
+    controller._on_ocr_complete([TextBlock(text="hello", bbox=native_box, confidence=1.0)])
+    (blocks, rect), = emitted
+    assert rect == region
+    assert blocks[0].bg_rgb == (60, 90, 120)
+    assert blocks[0].bbox == [[60, 40], [80, 40], [80, 50], [60, 50]]
+
+
+def test_scale_change_rejects_inflight_jobs_even_with_same_logical_rect(controller, monkeypatch):
+    region = QRect(0, 0, 500, 300)
+    controller._trans_job_seq = 1
+    controller._ocr_busy = True
+    controller._ocr_generation = controller._region_generation
+    assert controller.set_region(region, QRect(0, 0, 750, 450))
+    assert not controller.set_region(region, QRect(0, 0, 750, 450))
+    emitted = []
+    controller.translation_ready.connect(lambda blocks, rect: emitted.append(blocks))
+    translation_job = MagicMock()
+    monkeypatch.setattr(pipeline_module, "TranslationJobThread", translation_job)
+    controller._on_ocr_complete([_tb("old", 0)])
+    translation_job.assert_not_called()
+    controller.sender = lambda: type("OldTranslation", (), {"_job_id": 1})()
+    controller._on_translation_partial([_translated("old", "старый", 0)])
+    controller._on_translation_complete([_translated("old", "старый", 0)])
+    assert not emitted

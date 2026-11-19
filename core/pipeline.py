@@ -9,7 +9,7 @@ import time
 from typing import Optional
 
 import numpy as np
-from PyQt5.QtCore import QObject, QRect, Qt, QTimer, pyqtSignal, pyqtSlot
+from PyQt5.QtCore import QObject, QRect, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
 from PyQt5.QtWidgets import QApplication
 
 from core import local_llm, local_mt, models
@@ -56,11 +56,15 @@ class AppController(QObject):
         super().__init__(parent)
         self._config = config
         self._region: Optional[QRect] = None
+        self._native_region: Optional[QRect] = None
+        self._region_generation = 0
+        self._ocr_generation = 0
         self._active = False
         # Явная пауза от пользователя (hotkey / кнопка). Отличается от
         # временной auto-паузы при drag/resize рамки: drag-resume не должен
         # выводить из user-pause, иначе явная пауза самопроизвольно сбрасывалась бы.
         self._user_paused = False
+        self._interaction_paused = False
         self._ocr_busy = False
         self._current_ocr_job: Optional[OcrJobThread] = None
         self._current_trans_job: Optional[TranslationJobThread] = None
@@ -170,6 +174,8 @@ class AppController(QObject):
 
     @pyqtSlot()
     def _on_ocr_ready(self):
+        if self.sender() is not None and self.sender() is not self._ocr_worker:
+            return
         logger.info("OCR engine ready")
         self._warned_not_ready = False
         self.ocr_ready.emit()
@@ -177,30 +183,48 @@ class AppController(QObject):
 
     @pyqtSlot(str)
     def _on_ocr_error(self, msg: str):
+        if self.sender() is not None and self.sender() is not self._ocr_worker:
+            return
         logger.error(f"OCR error: {msg}")
         self.status_message.emit(f"Ошибка OCR: {msg}")
 
-    @pyqtSlot(QRect)
-    def set_region(self, region: QRect) -> None:
-        """Called when user selects a screen area."""
-        prev = self._region
-        self._region = region
-        # Если регион действительно сместился — сбрасываем дедуп-кэш,
-        # чтобы новая область гарантированно перерисовалась.
-        if prev is None or prev != region:
-            self._last_ocr_signature = None
-            self._last_translated_blocks = None
-            # Сигнатура кадра тоже становится невалидной (другой размер
-            # и другое содержимое — нельзя сравнивать).
-            self._last_frame_signature = None
-            self._last_frame_shape = None
-            self._frame_skip_count = 0
-            # Боксы детекции принадлежали старой области
-            self._last_det_boxes = None
-            self._det_skip_count = 0
-        # DEBUG, не INFO: рамку пользователь может двигать десятки раз
-        # в секунду — это засоряло бы production-лог сотнями записей.
-        logger.debug(f"Capture region set: {region}")
+    @property
+    def native_region(self) -> Optional[QRect]:
+        """Physical desktop rectangle used for the active overlay and capture."""
+        return QRect(self._native_region) if self._native_region is not None else None
+
+    def set_region(self, region: QRect, native_region: Optional[QRect] = None) -> bool:
+        """Set the Qt overlay area and its matching physical capture pixels."""
+        if native_region is None:
+            native_region = region
+        if self._region == region and self._native_region == native_region:
+            return False
+        self._region = QRect(region)
+        self._native_region = QRect(native_region)
+        self._invalidate_jobs()
+        self._last_translated_blocks = None
+        logger.debug("Capture region set: logical=%s, native=%s", region, native_region)
+        return True
+
+    def _invalidate_jobs(self) -> None:
+        # Results can arrive after stop, pause, a monitor move or a settings change.
+        # OCR checks its generation; translation checks the last accepted job id.
+        self._region_generation += 1
+        self._last_applied_trans_id = self._trans_job_seq
+        self._last_ocr_signature = None
+        self._last_frame_signature = None
+        self._last_frame_shape = None
+        self._frame_skip_count = 0
+        self._last_det_boxes = None
+        self._det_skip_count = 0
+        self._queued_blocks = None
+        self._inflight_signature = None
+        self._retry_blocks = None
+        self._retry_timer.stop()
+        self._trans_fail_streak = 0
+        for job in self.findChildren(QThread):
+            if hasattr(job, '_job_id') and job.isRunning():
+                job.requestInterruption()
 
     def _ensure_ocr_worker(self) -> None:
         """PERF-003: создать и запустить OCR worker при первом обращении."""
@@ -222,6 +246,8 @@ class AppController(QObject):
 
     @pyqtSlot()
     def start(self) -> None:
+        if self._active:
+            return
         if self._region is None:
             self.status_message.emit("Сначала выберите область")
             return
@@ -245,12 +271,12 @@ class AppController(QObject):
     @pyqtSlot()
     def stop(self) -> None:
         self._active = False
-        self._user_paused = False  # сброс, чтобы при следующем start() не были на паузе
+        self._interaction_paused = False
+        if self._user_paused:
+            self._user_paused = False
+            self.user_pause_changed.emit(False)
         self._timer.stop()
-        self._retry_timer.stop()
-        self._retry_blocks = None
-        self._trans_fail_streak = 0
-        self._queued_blocks = None
+        self._invalidate_jobs()
         self.status_message.emit("Остановлено")
         logger.info(
             f"Pipeline stopped. ticks={self._tick_count}, captures={self._capture_count}, "
@@ -264,45 +290,37 @@ class AppController(QObject):
         else:
             self.start()
 
+    @property
+    def _can_capture(self) -> bool:
+        return self._active and not (self._user_paused or self._interaction_paused)
+
+    def _suspend_pipeline(self) -> None:
+        self._timer.stop()
+        self._invalidate_jobs()
+
     @pyqtSlot()
     def pause(self) -> None:
-        """Временная пауза захвата (например, при перетаскивании рамки).
-        Сохраняет _active=True, но останавливает таймер. Resume — через resume()."""
-        if self._active and self._timer.isActive():
-            self._timer.stop()
-            logger.debug("Pipeline paused (timer stopped)")
+        """Suspend capture during a frame interaction."""
+        if self._active and not self._interaction_paused:
+            self._interaction_paused = True
+            self._suspend_pipeline()
 
     @pyqtSlot()
     def resume(self) -> None:
-        """Возобновляет захват после auto-паузы (drag/resize). Если
-        пользователь поставил явную паузу — игнорируем, она снимается
-        только через toggle_pause()/user_resume()."""
-        if self._user_paused:
-            logger.debug("resume() ignored: user paused explicitly")
-            return
-        if self._active and not self._timer.isActive():
-            self._timer.start()
-            logger.debug("Pipeline resumed (timer restarted)")
+        self._interaction_paused = False
+        self._reschedule_tick()
 
     @pyqtSlot()
     def toggle_pause(self) -> None:
-        """Явная пауза/возобновление пользователем (hotkey или кнопка).
-        Если перевод не активен — no-op."""
         if not self._active:
             return
+        self._user_paused = not self._user_paused
         if self._user_paused:
-            self._user_paused = False
-            if not self._timer.isActive():
-                self._timer.start()
-            self.status_message.emit("Перевод…")
-            self.user_pause_changed.emit(False)
-            logger.info("Pipeline RESUMED by user")
+            self._suspend_pipeline()
         else:
-            self._user_paused = True
-            self._timer.stop()
-            self.status_message.emit("Пауза")
-            self.user_pause_changed.emit(True)
-            logger.info("Pipeline PAUSED by user")
+            self._reschedule_tick()
+        self.status_message.emit("Пауза" if self._user_paused else "Перевод…")
+        self.user_pause_changed.emit(self._user_paused)
 
     def reload_config(self, config: configparser.ConfigParser) -> None:
         """Apply updated settings without restarting."""
@@ -310,19 +328,28 @@ class AppController(QObject):
         old_gpu = self._config.getboolean("ocr", "gpu", fallback=False)
         old_backend = self._config.get("ocr", "backend", fallback="easyocr")
         old_provider = self._provider()
+        previous = self._config
         self._config = config
         models.configure(config)
         new_provider = self._provider()
-        if new_provider != old_provider:
+        moved_models = (previous.get("local", "models_dir", fallback="") !=
+                        config.get("local", "models_dir", fallback=""))
+        if new_provider != old_provider or moved_models:
             # Освобождаем память прежнего локального движка и заставляем
             # текущий экран перевестись заново новым провайдером.
             if old_provider == "local_llm":
                 local_llm.server().stop()
             elif old_provider == "local_fast":
                 local_mt.unload()
-            self._last_ocr_signature = None
-            self._last_frame_signature = None
-            self._queued_blocks = None
+        # Identical text can require a new translation even when the OCR reader
+        # is reusable (e.g. en→ru switched to ru→en, or an API key changed).
+        relevant = ("languages", "ocr", "translation", "overlay", "local")
+        if any((dict(previous[s]) if s in previous else {}) !=
+               (dict(config[s]) if s in config else {}) for s in relevant):
+            self._invalidate_jobs()
+            self._last_translated_blocks = None
+            if self._region is not None and self._active:
+                self.translation_ready.emit([], self._region)
         interval = config.getint("general", "capture_interval_ms", fallback=1500)
         self._timer.setInterval(interval)
         self._cache.configure(
@@ -346,9 +373,8 @@ class AppController(QObject):
         if self._ocr_worker is not None and (
             new_langs != old_langs or new_gpu != old_gpu or new_backend != old_backend
         ):
-            was_active = self._active
-            if was_active:
-                self.stop()
+            self._ocr_worker.ready.disconnect(self._on_ocr_ready)
+            self._ocr_worker.error.disconnect(self._on_ocr_error)
             self._ocr_worker.stop()
             self._ocr_worker = None
             # Дедуп-кэши больше невалидны: другой Reader может распознать иначе
@@ -359,8 +385,9 @@ class AppController(QObject):
                 f"{sorted(new_langs)}, gpu {old_gpu} → {new_gpu}, "
                 f"backend {old_backend} → {new_backend}"
             )
-            if was_active:
-                self.start()  # лениво пересоздаст воркер с новым конфигом
+            if self._active:
+                self._ensure_ocr_worker()
+        self._reschedule_tick()
 
     # ── Frame-diff helpers ─────────────────────────────────────────────
 
@@ -438,16 +465,18 @@ class AppController(QObject):
         """Планирует следующий capture-тик. Таймер single-shot: перезапускается
         ПОСЛЕ завершения текущего цикла (OCR/translation), а не тикает без остановки.
         Это убирает 'OCR still busy' лог-спам и освобождает CPU когда цикл идёт."""
-        if self._active and not self._timer.isActive():
+        if self._can_capture and not self._timer.isActive():
             self._timer.start()
 
     @pyqtSlot()
     def _on_timer_tick(self) -> None:
         self._tick_count += 1
-        if not self._active or self._region is None:
+        if not self._can_capture or self._region is None:
             return
-        # _ocr_busy guard не нужен: таймер single-shot останавливается при
-        # запуске OCR job'а и перезапускается в _on_ocr_complete / _on_translation_complete.
+        # A translation completion or a frame drag can restart the timer while
+        # the previous OCR still owns the image and its coordinate transform.
+        if self._ocr_busy:
+            return
         if self._ocr_worker is None or self._ocr_worker._reader is None:
             # Предупреждаем один раз вместо спама
             if not self._warned_not_ready:
@@ -461,19 +490,19 @@ class AppController(QObject):
             self._reschedule_tick()
             return
 
-        r = self._region
-        logger.debug(
-            f"Tick #{self._tick_count}: capturing region "
-            f"x={r.x()} y={r.y()} w={r.width()} h={r.height()}"
-        )
-
         # Скрываем overlay перед захватом, чтобы он не попал в кадр
         # (иначе OCR прочитает уже переведённый текст → бесконечный цикл)
+        generation = self._region_generation
         self.capture_about_to_start.emit()
         QApplication.processEvents()
 
         cap_ts = time.time()
         try:
+            if not self._can_capture or generation != self._region_generation:
+                self._reschedule_tick()
+                return
+            r = self._native_region
+            logger.debug("Tick #%d: capturing native region %s", self._tick_count, r)
             image = capture_to_numpy(r.x(), r.y(), r.width(), r.height())
         except Exception as e:
             logger.error(f"Capture failed at tick #{self._tick_count}: {e}")
@@ -485,6 +514,9 @@ class AppController(QObject):
         finally:
             self.capture_finished.emit()
 
+        if generation != self._region_generation:
+            self._reschedule_tick()
+            return
         self._capture_count += 1
         cap_ms = (time.time() - cap_ts) * 1000
         self._last_capture_ts = time.time()
@@ -517,6 +549,7 @@ class AppController(QObject):
         self._frame_skip_count = 0
 
         self._ocr_busy = True
+        self._ocr_generation = generation
         self._last_ocr_start_ts = time.time()
         # Кадр нужен в _on_ocr_complete для сэмплирования цвета фона
         # под inpaint-подложку overlay.
@@ -537,7 +570,11 @@ class AppController(QObject):
 
     @pyqtSlot(object)
     def _on_ocr_complete(self, blocks: list) -> None:
+        stale_geometry = self._ocr_busy and self._ocr_generation != self._region_generation
         self._ocr_busy = False
+        if stale_geometry or not self._can_capture:
+            self._reschedule_tick()
+            return
         self._ocr_count += 1
         # PERF-007: обновляем кэш боксов детекции. Полный прогон приносит
         # свежие боксы; слабый recognize-only результат (пусто или низкая
@@ -594,6 +631,14 @@ class AppController(QObject):
 
         # Цвет фона под каждым блоком (для inpaint-подложки overlay).
         apply_bg_colors(getattr(self, "_last_capture_image", None), blocks)
+        # OCR and color sampling use original image pixels. Translation jobs,
+        # their caches and the overlay all use coordinates local to the Qt area.
+        native = self._native_region
+        if native.size() != self._region.size():
+            sx = self._region.width() / native.width()
+            sy = self._region.height() / native.height()
+            for block in blocks:
+                block.bbox = [[round(x * sx), round(y * sy)] for x, y in block.bbox]
 
         # Фильтрация: блоки, которые уже на target-языке — не переводим вообще
         # (например, русский → русский). На overlay их тоже не показываем,
@@ -765,9 +810,7 @@ class AppController(QObject):
             self._trans_fail_streak = 0
             self._retry_blocks = None
             return
-        if self._user_paused:
-            # На паузе в сеть не ходим; проверим снова позже.
-            self._retry_timer.start(self._RETRY_MAX_DELAY_S * 1000)
+        if not self._can_capture:
             return
         if self._signature(blocks) != self._last_ocr_signature:
             # Текст исчез/сменилась область — повторять нечего. Снимаем
@@ -787,7 +830,7 @@ class AppController(QObject):
         blocks, self._queued_blocks = self._queued_blocks, None
         if (
             blocks
-            and self._active
+            and self._can_capture
             and self._trans_running == 0
             and self._signature(blocks) == self._last_ocr_signature
         ):
@@ -800,9 +843,11 @@ class AppController(QObject):
         переведённые блоки, не дожидаясь остальных."""
         sender = self.sender()
         job_id = getattr(sender, "_job_id", None) if sender is not None else None
-        if job_id is not None and job_id != self._trans_job_seq:
+        if job_id is not None and (
+            job_id != self._trans_job_seq or job_id <= self._last_applied_trans_id
+        ):
             return  # уже запущен более новый джоб
-        if self._queued_blocks is not None or not self._active:
+        if self._queued_blocks is not None or not self._can_capture:
             return  # текст на экране сменился — этот результат устарел
         if self._region is not None:
             self.translation_ready.emit(translated_blocks, self._region)
@@ -812,6 +857,8 @@ class AppController(QObject):
         self._trans_running = max(0, self._trans_running - 1)
         if self._trans_running == 0:
             self._inflight_signature = None
+        if not self._can_capture:
+            return
         _sender = self.sender()
         if _sender is not None and getattr(_sender, "interrupted", False) is True:
             # Прерван ради более свежего текста: неполный результат на
@@ -877,20 +924,24 @@ class AppController(QObject):
                 lines.append(t)
         return "\n".join(lines)
 
-    def shutdown(self) -> None:
-        """Clean shutdown — save cache, stop workers, wait for in-flight jobs."""
-        self._timer.stop()
-        self._retry_timer.stop()
+    def shutdown(self, timeout_ms: int = 5000) -> bool:
+        """Stop accepting work and drain all child threads within one deadline."""
+        self.stop()
         self._autosave_timer.stop()
-        self._active = False
-        for job in (self._current_ocr_job, self._current_trans_job):
-            try:
-                if job is not None and job.isRunning():
-                    job.wait(2000)
-            except RuntimeError:
-                pass  # объект уже удалён Qt-ом
+        server = local_llm.server()
+        server.begin_shutdown()
+        jobs = self.findChildren(QThread)
+        for job in jobs:
+            job.requestInterruption()
+            job.quit()
+        deadline = time.monotonic() + timeout_ms / 1000
+        for job in jobs:
+            if job.isRunning():
+                job.wait(max(0, round((deadline - time.monotonic()) * 1000)))
         self._cache.save()
-        local_llm.server().stop()
-        if self._ocr_worker is not None:
-            self._ocr_worker.stop()
-        logger.info("Pipeline shut down")
+        drained = all(not job.isRunning() for job in jobs)
+        if drained:
+            server.stop()
+        else:
+            logger.warning("Операция OCR или перевода ещё завершается")
+        return drained

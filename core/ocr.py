@@ -142,10 +142,9 @@ class OcrWorker(QThread):
             return False
 
     def run(self) -> None:
-        """Initialize OCR backend (blocking) then enter idle loop."""
+        """Initialize the reader. Inference runs on separate OcrJobThreads."""
         if self._backend == "onnx" and self._try_init_onnx():
             self.ready.emit()
-            self.exec_()
             return
         try:
             import easyocr
@@ -166,15 +165,12 @@ class OcrWorker(QThread):
             self.error.emit(str(e))
             return
 
-        # Reader готов. Дальше реальный OCR делают отдельные OcrJobThread'ы,
-        # а этот поток должен просто спать до stop(). Используем Qt event loop
-        # (exec_) вместо busy-loop `while: msleep(50)` — тот будил CPU 20 раз/сек
-        # впустую. quit() из stop() корректно завершает exec_().
-        self.exec_()
-
     def stop(self) -> None:
-        self.quit()
-        self.wait(3000)
+        # A model load in native code can take seconds. Retire the reader
+        # once loading finishes instead of blocking the Settings dialog.
+        self.finished.connect(self.deleteLater)
+        if not self.isRunning():
+            self.deleteLater()
 
 
 class OcrJobThread(QThread):
