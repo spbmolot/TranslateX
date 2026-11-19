@@ -14,8 +14,8 @@ import logging
 from typing import List
 
 from PyQt5.QtCore import QEasingCurve, QPropertyAnimation, QRect, Qt, pyqtSlot
-from PyQt5.QtGui import QColor, QFont, QPainter, QPen, QBrush, QFontMetrics, QRegion
-from PyQt5.QtWidgets import QWidget
+from PyQt5.QtGui import QColor, QFont, QPainter, QPen, QBrush, QFontMetrics, QRegion, QScreen
+from PyQt5.QtWidgets import QApplication, QWidget
 
 from core.translator import TranslatedBlock
 from utils import geometry
@@ -186,27 +186,68 @@ class TranslationOverlay(QWidget):
         переводом виден как обычно, клики проходят насквозь."""
         mask = QRegion()
         for b in self._blocks:
-            bx, by, bw, bh = geometry.easyocr_bbox_to_rect(b.bbox)
-            bx, by, bw, bh = geometry.clamp_rect(
-                bx, by, bw, bh, self.width(), self.height())
+            bx, by, bw, bh = self._block_rect(b)
             if bw > 4 and bh > 4:
                 mask += QRegion(bx, by, bw, bh)
         return mask
 
-    def update_blocks(self, blocks: List[TranslatedBlock], region: QRect) -> None:
-        sig = self._blocks_signature(blocks, region)
-        unchanged = sig == self._last_blocks_sig
-        self._last_blocks_sig = sig
+    def _block_rect(self, block: TranslatedBlock):
+        x, y, w, h = geometry.easyocr_bbox_to_rect(block.bbox)
+        if self._region.isValid() and self._region.size() != self.size():
+            # Windows may assign the toolbar frame and its smaller overlay to
+            # different monitors at a seam. Both cover the same capture pixels
+            # but their logical widths and heights can differ.
+            sx = self.width() / self._region.width()
+            sy = self.height() / self._region.height()
+            right, bottom = round((x + w) * sx), round((y + h) * sy)
+            x, y = round(x * sx), round(y * sy)
+            w, h = right - x, bottom - y
+        return geometry.clamp_rect(x, y, w, h, self.width(), self.height())
+
+    def _position_on_capture(self, region, screen, native_region):
+        if native_region is not None and QApplication.platformName() == "windows":
+            if self.windowHandle() is None:
+                self.setGeometry(region)
+            hwnd = int(self.winId())
+            pixels = native_region.getRect()
+            if (win32_utils.window_client_rect(hwnd) == pixels
+                    or win32_utils.set_frameless_rect(hwnd, *pixels)):
+                # QWidget caches its geometry until Windows' queued move/resize
+                # events arrive. Sync it before show() replays the old geometry.
+                self.setGeometry(self.windowHandle().geometry())
+                return
+        if screen is not None and self.screen() != screen:
+            # Create the QWindow before the first show so Qt uses the capture
+            # monitor's scale when it converts this geometry to native pixels.
+            self.winId()
+            self.windowHandle().setScreen(screen)
+        self.setGeometry(region)
+
+    def update_blocks(self, blocks: List[TranslatedBlock], region: QRect,
+                      screen: QScreen = None, native_region: QRect = None) -> None:
+        """Both the region and its local OCR boxes are in the capture window's DIPs."""
         self._blocks = blocks
         self._region = region
-        self.setGeometry(region)
         if not blocks:
             # Нет блоков для отображения (например, всё уже на target-языке) —
             # прячем overlay, чтобы не было пустого окна и старых надписей.
             self.hide_overlay()
             return
+        self._position_on_capture(region, screen, native_region)
+        sig = (self._blocks_signature(blocks, region), self.size(), self.devicePixelRatioF())
+        unchanged = sig == self._last_blocks_sig
+        self._last_blocks_sig = sig
         if self._opaque_mode and not unchanged:
-            self.setMask(self._blocks_mask())
+            mask = self._blocks_mask()
+            if mask == self.mask() and self.windowHandle() is not None:
+                # QWidget skips equal masks. The HWND needs fresh native pixels
+                # when its monitor's DPI changes even for the same logical mask.
+                self.windowHandle().setMask(mask)
+            else:
+                self.setMask(mask)
+        if self._opaque_mode and self.mask().isEmpty():
+            self.hide_overlay()
+            return
         if not self._visible:
             self.show_overlay()
             self.update()
@@ -256,7 +297,7 @@ class TranslationOverlay(QWidget):
             mid = (lo + hi) // 2
             font = QFont("Segoe UI", mid)
             font.setWeight(QFont.Medium)
-            fm = QFontMetrics(font)
+            fm = QFontMetrics(font, self)
             br = fm.boundingRect(
                 0, 0, max_w, 10000,
                 Qt.TextWordWrap | Qt.AlignLeft,
@@ -289,10 +330,7 @@ class TranslationOverlay(QWidget):
         user_cap_pt = self._effective_font_size()
 
         for block in self._blocks:
-            bx, by, bw, bh = geometry.easyocr_bbox_to_rect(block.bbox)
-            bx, by, bw, bh = geometry.clamp_rect(
-                bx, by, bw, bh, self.width(), self.height()
-            )
+            bx, by, bw, bh = self._block_rect(block)
             if bw <= 4 or bh <= 4:
                 continue
 

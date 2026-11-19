@@ -8,10 +8,11 @@ import math
 
 from PyQt5.QtCore import QPoint, QRect, QRectF, QSize, Qt, QTimer, pyqtSignal, pyqtSlot
 from PyQt5.QtGui import QColor, QPainter, QPen
-from PyQt5.QtWidgets import QHBoxLayout, QLabel, QPushButton, QWidget
+from PyQt5.QtWidgets import QApplication, QHBoxLayout, QLabel, QMenu, QPushButton, QToolButton, QWidget
 
 from ui import icons
 from ui import theme
+from utils.dpi_geometry import logical_to_native, native_to_logical
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,7 @@ class RegionFrame(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._drag_pos = None
+        self._watched_screen = None
         self._resizing = False
         self._resize_edge = None   # 'left','right','top','bottom','tl','tr','bl','br'
         self._translating = False  # True when actively capturing/translating
@@ -55,6 +57,7 @@ class RegionFrame(QWidget):
         # выключен до сигнала AppController.ocr_loading → set_ocr_loading().
         self._ocr_loading = False
         self._paused = False       # для пульсации/тоста
+        self._pause_shortcut = ""
 
         self.setWindowFlags(
             Qt.FramelessWindowHint |
@@ -112,46 +115,63 @@ class RegionFrame(QWidget):
                 border-top-left-radius: 5px;
                 border-top-right-radius: 5px;
             }}
+            QWidget#wideTools, QWidget#compactTools {{ background: transparent; }}
+            QLabel#dragGrip {{ color: {c['sublabel']}; font-size: 16px; background: transparent; }}
+        """ + """
+            QPushButton, QToolButton {
+                background: transparent; color: white; border: 1px solid #899ab4;
+                border-radius: 3px; padding: 2px 6px;
+            }
+            QPushButton { min-width: 28px; }
+            QPushButton#startButton, QPushButton#stopButton {
+                min-width: 64px; padding: 2px 10px; font-size: 12px;
+            }
+            QPushButton#closeButton { min-width: 26px; border-color: transparent; }
+            QPushButton:hover, QToolButton:hover { background: #485d7c; border-color: #b5d8ff; }
+            QPushButton:pressed, QToolButton:pressed { background: #263751; }
+            QPushButton#closeButton:hover { background: #ac3036; }
+            QPushButton#closeButton:pressed { background: #80252a; }
+            QPushButton:focus, QToolButton:focus, QPushButton#closeButton:focus { border-color: white; }
+            QToolButton::menu-indicator { image: none; }
         """
 
-    _LABEL_BTN_QSS = """
-        QPushButton {
-            color: white; border: 1px solid #555; border-radius: 3px;
-            padding: 2px 10px; font-size: 12px; min-width: 64px;
-        }
-        QPushButton:hover { border-color: #4fc3f7; background: rgba(79,195,247,40); }
-        QPushButton:pressed { background: rgba(79,195,247,70); }
-    """
-
-    _ICON_BTN_QSS = """
-        QPushButton {
-            color: white; background: transparent;
-            border: 1px solid #555; border-radius: 3px;
-            padding: 2px 6px; min-width: 28px;
-        }
-        QPushButton:hover { border-color: #4fc3f7; background: rgba(79,195,247,45); }
-        QPushButton:pressed { background: rgba(79,195,247,80); }
-    """
+    @staticmethod
+    def _action_colors(normal: str, hover: str, pressed: str) -> str:
+        return (
+            f"QAbstractButton {{ background: {normal}; }}"
+            f"QAbstractButton:hover {{ background: {hover}; }}"
+            f"QAbstractButton:pressed {{ background: {pressed}; }}"
+        )
 
     def _build_toolbar(self) -> None:
         self._toolbar = QWidget(self)
         self._toolbar.setObjectName("tbRoot")
         self._toolbar.setFixedHeight(_TOOLBAR_H)
+        # Child labels and empty layout space inherit this even when the last
+        # mouse move delivered to the frame was on a resize handle.
+        self._toolbar.setCursor(Qt.OpenHandCursor)
         self._toolbar.setStyleSheet(self._toolbar_qss())
 
-        layout = QHBoxLayout(self._toolbar)
+        toolbar_layout = QHBoxLayout(self._toolbar)
+        toolbar_layout.setContentsMargins(0, 0, 0, 0)
+        toolbar_layout.setSpacing(0)
+        self._wide_tools = QWidget(self._toolbar)
+        self._wide_tools.setObjectName("wideTools")
+        toolbar_layout.addWidget(self._wide_tools)
+        layout = QHBoxLayout(self._wide_tools)
         layout.setContentsMargins(8, 2, 8, 2)
         layout.setSpacing(6)
 
         # Drag-handle точки (#12) — подсказка, что рамку можно таскать.
         self._drag_dots = QLabel("⠿", self._toolbar)
-        self._drag_dots.setStyleSheet("color: #6c7a90; font-size: 16px; background: transparent;")
+        self._drag_dots.setObjectName("dragGrip")
         self._drag_dots.setToolTip("Потяните, чтобы переместить рамку")
         layout.addWidget(self._drag_dots)
 
         # Size / статистика (рендерится rich-text «пилюлями» в _update_size_label)
         self._size_label = QLabel("", self._toolbar)
         self._size_label.setTextFormat(Qt.RichText)
+        self._size_label.setTextInteractionFlags(Qt.NoTextInteraction)
         self._size_label.setStyleSheet("background: transparent;")
         layout.addWidget(self._size_label)
 
@@ -166,7 +186,8 @@ class RegionFrame(QWidget):
         layout.addStretch()
 
         self._btn_start = QPushButton(" Старт", self._toolbar)
-        self._btn_start.setStyleSheet(self._LABEL_BTN_QSS + "QPushButton { background: #2e7d32; }")
+        self._btn_start.setObjectName("startButton")
+        self._btn_start.setStyleSheet(self._action_colors("#2e7d32", "#276e2d", "#205524"))
         self._btn_start.setIcon(icons.play())
         self._btn_start.setIconSize(QSize(_ICON_SZ, _ICON_SZ))
         self._btn_start.setCursor(Qt.PointingHandCursor)
@@ -174,7 +195,8 @@ class RegionFrame(QWidget):
         layout.addWidget(self._btn_start)
 
         self._btn_stop = QPushButton(" Стоп", self._toolbar)
-        self._btn_stop.setStyleSheet(self._LABEL_BTN_QSS + "QPushButton { background: #c62828; }")
+        self._btn_stop.setObjectName("stopButton")
+        self._btn_stop.setStyleSheet(self._action_colors("#c62828", "#ad2424", "#8a2020"))
         self._btn_stop.setIcon(icons.stop())
         self._btn_stop.setIconSize(QSize(_ICON_SZ, _ICON_SZ))
         self._btn_stop.setCursor(Qt.PointingHandCursor)
@@ -184,12 +206,9 @@ class RegionFrame(QWidget):
 
         # Pause/Resume — видим только когда идёт перевод. Toggle button.
         self._btn_pause = QPushButton(self._toolbar)
-        self._btn_pause.setStyleSheet(
-            self._ICON_BTN_QSS + "QPushButton { background: #455a64; }"
-        )
+        self._btn_pause.setStyleSheet(self._action_colors("#455a64", "#526976", "#37474f"))
         self._btn_pause.setIcon(icons.pause())
         self._btn_pause.setIconSize(QSize(_ICON_SZ, _ICON_SZ))
-        self._btn_pause.setToolTip("Пауза/возобновить (Ctrl+Shift+Space)")
         self._btn_pause.setCursor(Qt.PointingHandCursor)
         self._btn_pause.clicked.connect(self.pause_toggle_requested)
         self._btn_pause.setVisible(False)
@@ -197,7 +216,6 @@ class RegionFrame(QWidget):
 
         self._btn_select = QPushButton(self._toolbar)
         self._btn_select.setToolTip("Выбрать новую область экрана")
-        self._btn_select.setStyleSheet(self._ICON_BTN_QSS)
         self._btn_select.setIcon(icons.select())
         self._btn_select.setIconSize(QSize(_ICON_SZ, _ICON_SZ))
         self._btn_select.setCursor(Qt.PointingHandCursor)
@@ -206,7 +224,6 @@ class RegionFrame(QWidget):
 
         self._btn_history = QPushButton(self._toolbar)
         self._btn_history.setToolTip("История переводов")
-        self._btn_history.setStyleSheet(self._ICON_BTN_QSS)
         self._btn_history.setIcon(icons.clock())
         self._btn_history.setIconSize(QSize(_ICON_SZ, _ICON_SZ))
         self._btn_history.setCursor(Qt.PointingHandCursor)
@@ -215,7 +232,6 @@ class RegionFrame(QWidget):
 
         self._btn_settings = QPushButton(self._toolbar)
         self._btn_settings.setToolTip("Настройки")
-        self._btn_settings.setStyleSheet(self._ICON_BTN_QSS)
         self._btn_settings.setIcon(icons.gear())
         self._btn_settings.setIconSize(QSize(_ICON_SZ, _ICON_SZ))
         self._btn_settings.setCursor(Qt.PointingHandCursor)
@@ -224,15 +240,88 @@ class RegionFrame(QWidget):
 
         self._btn_close = QPushButton(self._toolbar)
         self._btn_close.setToolTip("Закрыть рамку")
-        self._btn_close.setStyleSheet(
-            "QPushButton { background: transparent; border: none; min-width: 26px; }"
-            "QPushButton:hover { background: rgba(255,82,82,60); border-radius: 3px; }"
-        )
+        self._btn_close.setObjectName("closeButton")
         self._btn_close.setIcon(icons.close())
         self._btn_close.setIconSize(QSize(_ICON_SZ, _ICON_SZ))
         self._btn_close.setCursor(Qt.PointingHandCursor)
-        self._btn_close.clicked.connect(self._on_close)
+        self._btn_close.clicked.connect(self.close)
         layout.addWidget(self._btn_close)
+        for button in (self._btn_select, self._btn_history, self._btn_settings, self._btn_close):
+            button.setAccessibleName(button.toolTip())
+
+        self._compact_tools = QWidget(self._toolbar)
+        self._compact_tools.setObjectName("compactTools")
+        compact = QHBoxLayout(self._compact_tools)
+        compact.setContentsMargins(4, 2, 4, 2)
+        compact.setSpacing(4)
+        compact.addStretch()
+        self._compact_primary = QToolButton(self._compact_tools)
+        self._compact_primary.setFocusPolicy(Qt.StrongFocus)
+        self._compact_primary.setCursor(Qt.PointingHandCursor)
+        self._compact_primary.clicked.connect(self._on_compact_primary)
+        compact.addWidget(self._compact_primary)
+        self._more = QToolButton(self._compact_tools)
+        self._more.setText("…")
+        self._more.setAccessibleName("Ещё действия")
+        self._more.setToolTip("Ещё действия")
+        self._more.setFixedWidth(28)
+        self._more.setFocusPolicy(Qt.StrongFocus)
+        self._more.setCursor(Qt.PointingHandCursor)
+        self._more.setPopupMode(QToolButton.InstantPopup)
+        menu = QMenu(self._more)
+        menu.setCursor(Qt.ArrowCursor)
+        self._pause_action = menu.addAction("Пауза")
+        self._pause_action.triggered.connect(self.pause_toggle_requested)
+        menu.addAction("Выбрать область").triggered.connect(self.select_region_requested)
+        menu.addAction("История переводов").triggered.connect(self.history_requested)
+        menu.addAction("Настройки").triggered.connect(self.settings_requested)
+        menu.addSeparator()
+        menu.addAction("Закрыть рамку").triggered.connect(self.close)
+        self._more.setMenu(menu)
+        compact.addWidget(self._more)
+        toolbar_layout.addWidget(self._compact_tools)
+        self._compact_tools.hide()
+        self._update_primary_action()
+        self.set_pause_shortcut("")
+
+    def _on_compact_primary(self) -> None:
+        if self._translating:
+            self._on_stop()
+        else:
+            self._on_start()
+
+    def _update_primary_action(self) -> None:
+        button = self._btn_stop if self._translating else self._btn_start
+        action = "Остановить перевод" if self._translating else "Начать перевод"
+        self._compact_primary.setText(button.text().strip())
+        self._compact_primary.setIcon(button.icon())
+        self._compact_primary.setStyleSheet(button.styleSheet())
+        self._compact_primary.setToolTip(action)
+        self._compact_primary.setAccessibleName(action)
+        self._pause_action.setVisible(self._translating)
+
+    def _fit_toolbar(self) -> None:
+        # Keep the regular controls visible as long as they fit, sacrificing
+        # the counters before moving those controls into the overflow menu.
+        stats_width = self._size_label.sizeHint().width() + self._wide_tools.layout().spacing()
+        controls_width = self._wide_tools.sizeHint().width()
+        if not self._size_label.isHidden():
+            controls_width -= stats_width
+        self._size_label.setVisible(self.width() >= controls_width + stats_width)
+        compact = self.width() < controls_width
+        self._wide_tools.setVisible(not compact)
+        self._compact_tools.setVisible(compact)
+        if compact:
+            # Even the minimum 80-DIP capture leaves room for both icons.
+            style = Qt.ToolButtonTextBesideIcon if self.width() >= 130 else Qt.ToolButtonIconOnly
+            self._compact_primary.setToolButtonStyle(style)
+
+    def set_pause_shortcut(self, text: str) -> None:
+        self._pause_shortcut = text
+        action = "Возобновить" if self._paused else "Пауза"
+        self._btn_pause.setAccessibleName(action)
+        self._btn_pause.setToolTip(f"{action} ({text})" if text else action)
+        self._pause_action.setText(f"{action}\t{text}" if text else action)
 
     def refresh_theme(self) -> None:
         """Перекрасить тулбар под текущую тему (вызывается при смене темы)."""
@@ -241,25 +330,46 @@ class RegionFrame(QWidget):
         self.update()
 
     def capture_rect(self) -> QRect:
-        """Return the inner capture area in screen coordinates (excluding toolbar & border)."""
-        return QRect(
-            self.x() + _BORDER,
-            self.y() + _TOOLBAR_H,
-            self.width() - _BORDER * 2,
-            self.height() - _TOOLBAR_H - _BORDER,
-        )
+        """Capture area in the frame screen's logical Qt coordinates."""
+        return native_to_logical(self.capture_native_rect(), self.screen())
 
-    def show_at(self, rect: QRect) -> None:
-        """Position frame around the given screen rect (from selector)."""
-        self.setGeometry(
-            rect.x() - _BORDER,
-            rect.y() - _TOOLBAR_H,
-            rect.width() + _BORDER * 2,
-            rect.height() + _TOOLBAR_H + _BORDER,
-        )
-        self._update_size_label()
+    def _native_window_rect(self) -> QRect:
+        if self.windowHandle() and QApplication.platformName() == "windows":
+            from utils.win32_utils import window_client_rect
+            bounds = window_client_rect(int(self.winId()))
+            if bounds is not None:
+                return QRect(*bounds)
+        return logical_to_native(self.geometry(), self.screen())
+
+    def capture_native_rect(self) -> QRect:
+        """Physical desktop pixels inside the frame, including when it spans monitors."""
+        margins = QSize(_BORDER, _TOOLBAR_H) * self.devicePixelRatioF()
+        return self._native_window_rect().adjusted(
+            margins.width(), margins.height(), -margins.width(), -margins.width())
+
+    def show_at(self, rect: QRect, screen=None) -> None:
+        """Position the frame around a selection expressed on its owner screen."""
+        screen = screen or QApplication.screenAt(rect.center()) or self.screen()
+        if self.windowHandle() is None:
+            self.winId()
+            self.windowHandle().screenChanged.connect(self._watch_screen)
+        self.windowHandle().setScreen(screen)
+        self._watch_screen(screen)
+        outer = rect.adjusted(-_BORDER, -_TOOLBAR_H, _BORDER, _BORDER)
+        self.setGeometry(outer)
         self.show()
+        if QApplication.platformName() == "windows":
+            # A logical corner can fall in a Qt virtual desktop gap. Avoid Qt
+            # guessing which monitor owns that position on mixed-DPI desktops.
+            from utils.win32_utils import set_frameless_rect
+            margins = QSize(_BORDER, _TOOLBAR_H) * screen.devicePixelRatio()
+            bounds = logical_to_native(rect, screen).adjusted(
+                -margins.width(), -margins.height(), margins.width(), margins.width())
+            minimum = self.minimumSize() * screen.devicePixelRatio()
+            bounds.setSize(bounds.size().expandedTo(minimum))
+            set_frameless_rect(int(self.winId()), *bounds.getRect())
         self.raise_()
+        self._update_size_label()
         # Рамка не должна попадать в захват: скруглённые углы бордюра
         # залезают на пару пикселей внутрь области OCR. Best-effort —
         # на старых Windows API вернёт False, это не критично.
@@ -271,6 +381,26 @@ class RegionFrame(QWidget):
             except Exception:
                 self._capture_excluded = False
 
+    def _watch_screen(self, screen) -> None:
+        if self._watched_screen == screen:
+            return
+        previous = self._watched_screen
+        self._watched_screen = screen
+        if previous is not None:
+            try:
+                previous.geometryChanged.disconnect(self._screen_geometry_changed)
+                previous.logicalDotsPerInchChanged.disconnect(self._screen_geometry_changed)
+            except RuntimeError:
+                pass  # QScreen was destroyed during monitor removal.
+        if screen is not None:
+            screen.geometryChanged.connect(self._screen_geometry_changed)
+            screen.logicalDotsPerInchChanged.connect(self._screen_geometry_changed)
+            self._screen_geometry_changed()
+
+    def _screen_geometry_changed(self, *_):
+        # Qt finishes applying the new window geometry after screenChanged.
+        QTimer.singleShot(0, self._update_size_label)
+
     def set_translating(self, active: bool) -> None:
         self._translating = active
         self._btn_start.setVisible(not active)
@@ -278,7 +408,6 @@ class RegionFrame(QWidget):
         self._btn_pause.setVisible(active)
         if active:
             self._pulse_timer.start()
-            self._btn_stop.setText(" Работает")
             self._show_toast("Работает")
         else:
             self._pulse_timer.stop()
@@ -291,6 +420,8 @@ class RegionFrame(QWidget):
             self._captures = 0
             self._ocr_blocks_last = 0
             self._translations = 0
+        self._update_primary_action()
+        self.set_pause_shortcut(self._pause_shortcut)
         self._update_size_label()
         self.update()
 
@@ -299,14 +430,13 @@ class RegionFrame(QWidget):
         """Слот для AppController.user_pause_changed — обновляет UI кнопки и
         приостанавливает пульсацию rec-индикатора."""
         self._paused = paused
+        self.set_pause_shortcut(self._pause_shortcut)
         if paused:
             self._btn_pause.setIcon(icons.play())
-            self._btn_pause.setToolTip("Возобновить (Ctrl+Shift+Space)")
             self._pulse_timer.stop()
             self._show_toast("Пауза")
         else:
             self._btn_pause.setIcon(icons.pause())
-            self._btn_pause.setToolTip("Пауза (Ctrl+Shift+Space)")
             if self._translating:
                 self._pulse_timer.start()
                 self._show_toast("Работает")
@@ -316,6 +446,7 @@ class RegionFrame(QWidget):
     def set_ocr_loading(self) -> None:
         self._ocr_loading = True
         self._ocr_label.setVisible(True)
+        self._fit_toolbar()
         if not self._spinner_timer.isActive():
             self._spinner_timer.start()
 
@@ -323,6 +454,7 @@ class RegionFrame(QWidget):
         self._ocr_loading = False
         self._spinner_timer.stop()
         self._ocr_label.setVisible(False)
+        self._fit_toolbar()
 
     @pyqtSlot()
     def _on_spinner_tick(self) -> None:
@@ -331,6 +463,7 @@ class RegionFrame(QWidget):
         self._spinner_phase = (self._spinner_phase + 1) % 4
         dots = "." * (self._spinner_phase + 1)
         self._ocr_label.setText(f"загрузка OCR{dots}")
+        self._fit_toolbar()
 
     # ── Тост по центру рамки (#10) ─────────────────────────────────────────
     def show_toast(self, text: str) -> None:
@@ -372,6 +505,10 @@ class RegionFrame(QWidget):
 
     # ── Events ──────────────────────────────────────────────────────
 
+    def moveEvent(self, event) -> None:
+        super().moveEvent(event)
+        self._update_size_label()
+
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._toolbar.setGeometry(0, 0, self.width(), _TOOLBAR_H)
@@ -388,11 +525,12 @@ class RegionFrame(QWidget):
         )
 
     def _update_size_label(self) -> None:
-        cr = self.capture_rect()
+        native = self.capture_native_rect()
+        cr = native_to_logical(native, self.screen())
         accent = theme.frame_colors()["sublabel"]
         size_html = (
             f"<span style='color:{accent}; font-size:11px;'>"
-            f"{cr.width()} × {cr.height()}</span>"
+            f"{native.width()} × {native.height()}</span>"
         )
         if self._translating:
             pills = "&nbsp;".join((
@@ -404,11 +542,13 @@ class RegionFrame(QWidget):
         else:
             text = size_html
         self._size_label.setText(text)
+        self._fit_toolbar()
         # Эмитим region_changed ТОЛЬКО при реальном изменении геометрии,
         # иначе обновление счётчиков (кадров/блоков) спамит pipeline.set_region
         # и засоряет лог сотнями одинаковых "Capture region set".
-        if cr != getattr(self, "_last_emitted_rect", None):
-            self._last_emitted_rect = cr
+        state = (cr, native, self.screen(), self.devicePixelRatioF())
+        if state != getattr(self, "_last_emitted_rect", None):
+            self._last_emitted_rect = state
             self.region_changed.emit(cr)
 
     def paintEvent(self, event) -> None:
@@ -468,7 +608,7 @@ class RegionFrame(QWidget):
         x, y = pos.x(), pos.y()
         w, h = self.width(), self.height()
         # Над тулбаром resize не активен (весь этот слой — перетаскивание)
-        if y < _TOOLBAR_H:
+        if y < _TOOLBAR_H or not self.rect().contains(pos):
             return ""
         on_left = x < _GRIP
         on_right = x > w - _GRIP
@@ -492,26 +632,34 @@ class RegionFrame(QWidget):
         "tr": Qt.SizeBDiagCursor,   "bl": Qt.SizeBDiagCursor,
     }
 
+    def _set_hover_cursor(self, pos: QPoint) -> None:
+        if self._toolbar.geometry().contains(pos):
+            self.setCursor(Qt.OpenHandCursor)
+        else:
+            self.setCursor(self._CURSOR_MAP.get(self._edge_at(pos), Qt.ArrowCursor))
+
+    def _native_pointer(self, event) -> QPoint:
+        offset = (event.localPos() * self.devicePixelRatioF()).toPoint()
+        return self._native_window_rect().topLeft() + offset
+
+    def _set_native_geometry(self, bounds: QRect) -> None:
+        if QApplication.platformName() == "windows":
+            from utils.win32_utils import set_frameless_rect
+            if set_frameless_rect(int(self.winId()), *bounds.getRect()):
+                return
+        self.setGeometry(native_to_logical(bounds, self.screen()))
+
     def mouseMoveEvent(self, event) -> None:
         if self._resizing and self._resize_edge:
-            self._do_resize(event.globalPos())
+            self._do_resize(self._native_pointer(event))
             return
         if self._drag_pos is not None:
-            delta = event.globalPos() - self._drag_pos
-            self.move(self.pos() + delta)
-            self._drag_pos = event.globalPos()
-            self._update_size_label()
+            bounds = self._native_window_rect()
+            grab_offset = (self._drag_pos * self.devicePixelRatioF()).toPoint()
+            bounds.moveTopLeft(self._native_pointer(event) - grab_offset)
+            self._set_native_geometry(bounds)
             return
-        # Обновляем курсор в зависимости от зоны
-        if event.pos().y() < _TOOLBAR_H:
-            # Тулбар — зона перемещения. На кнопках Qt сам покажет PointingHandCursor.
-            self.setCursor(Qt.SizeAllCursor)
-            return
-        edge = self._edge_at(event.pos())
-        if edge:
-            self.setCursor(self._CURSOR_MAP.get(edge, Qt.ArrowCursor))
-        else:
-            self.setCursor(Qt.ArrowCursor)
+        self._set_hover_cursor(event.pos())
 
     def mousePressEvent(self, event) -> None:
         if event.button() != Qt.LeftButton:
@@ -521,11 +669,14 @@ class RegionFrame(QWidget):
         if edge:
             self._resizing = True
             self._resize_edge = edge
-            self._resize_origin = event.globalPos()
-            self._resize_geom = self.geometry()
+            self.setCursor(self._CURSOR_MAP[edge])
+            self._resize_origin = self._native_pointer(event)
+            self._resize_geom = self._native_window_rect()
             started_interaction = True
-        elif event.pos().y() < _TOOLBAR_H:
-            self._drag_pos = event.globalPos()
+        elif self._toolbar.geometry().contains(event.pos()):
+            self._drag_pos = event.localPos()
+            self._toolbar.setCursor(Qt.ClosedHandCursor)
+            self.setCursor(Qt.ClosedHandCursor)
             started_interaction = True
         # Если начали двигать/ресайзить во время активного перевода — паузим pipeline.
         if started_interaction and self._translating and not self._paused_by_drag:
@@ -536,9 +687,12 @@ class RegionFrame(QWidget):
     def mouseReleaseEvent(self, event) -> None:
         if event.button() == Qt.LeftButton:
             was_interacting = self._drag_pos is not None or self._resizing
+            if self._drag_pos is not None:
+                self._toolbar.setCursor(Qt.OpenHandCursor)
             self._drag_pos = None
             self._resizing = False
             self._resize_edge = None
+            self._set_hover_cursor(event.pos())
             self._update_size_label()
             if was_interacting and self._paused_by_drag:
                 # Перезапускаем дебаунс-таймер: возобновим перевод спустя 1.2с,
@@ -562,8 +716,8 @@ class RegionFrame(QWidget):
         g = self._resize_geom
         x, y, w, h = g.x(), g.y(), g.width(), g.height()
         e = self._resize_edge
-        min_w = _MIN_SIZE + _BORDER * 2
-        min_h = _MIN_SIZE + _TOOLBAR_H + _BORDER
+        minimum = self.minimumSize() * self.devicePixelRatioF()
+        min_w, min_h = minimum.width(), minimum.height()
 
         if e in self._LEFT_EDGES:
             nw = max(w - dx, min_w)
@@ -578,12 +732,14 @@ class RegionFrame(QWidget):
         if e in self._BOTTOM_EDGES:
             h = max(h + dy, min_h)
 
-        self.setGeometry(x, y, w, h)
-        self._update_size_label()
+        self._set_native_geometry(QRect(x, y, w, h))
 
     def keyPressEvent(self, event) -> None:
         if event.key() == Qt.Key_Escape:
-            self._on_close()
+            self.close()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     # ── Button handlers ─────────────────────────────────────────────
 
@@ -595,7 +751,14 @@ class RegionFrame(QWidget):
         self.set_translating(False)
         self.stop_requested.emit()
 
-    def _on_close(self) -> None:
+    def closeEvent(self, event) -> None:
+        self._resume_timer.stop()
+        self._paused_by_drag = False
+        self._drag_pos = None
+        self._resizing = False
+        self._resize_edge = None
+        self._toolbar.setCursor(Qt.OpenHandCursor)
+        self.unsetCursor()
         self.set_translating(False)
-        self.hide()
         self.close_requested.emit()
+        super().closeEvent(event)

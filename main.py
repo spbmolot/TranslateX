@@ -3,7 +3,7 @@ TranslateX — Перевод текста с экрана в реальном �
 Точка входа: DPI, Qt, склейка компонентов.
 
 Логика работы (как Bandicam):
-1. Пользователь нажимает Ctrl+Shift+T (или через трей)
+1. Пользователь выбирает область через трей или настраиваемую горячую клавишу.
 2. Выбирает область экрана (затемнённый fullscreen + drag)
 3. Появляется рамка-фрейм с кнопками "Старт / Стоп / Закрыть"
 4. Рамку можно перемещать и ресайзить
@@ -17,6 +17,14 @@ import logging.handlers
 import os
 import sys
 from pathlib import Path
+
+from utils.win32_utils import monitor_bounds_at, request_existing_frame, set_dpi_awareness
+
+set_dpi_awareness()
+
+# A shortcut launched again can restore the running window before importing OCR.
+if __name__ == "__main__" and request_existing_frame():
+    sys.exit(0)
 
 # Принудительная UTF-8 кодировка для stdout/stderr на Windows
 # (иначе русский текст в логах падает с UnicodeEncodeError на cp1251).
@@ -114,13 +122,11 @@ except Exception as _e:  # pragma: no cover
     print(f"[TranslateX] torch preload FAILED: {_e}", file=sys.stderr)
     traceback.print_exc(file=sys.stderr)
 
-from utils.win32_utils import set_dpi_awareness
-set_dpi_awareness()
-
 from PyQt5.QtCore import QObject, QRect, Qt, pyqtSlot, QTimer
 from PyQt5.QtWidgets import QApplication
 
 from core.config_validator import validate_and_fix, log_issues
+from core.shortcuts import HOTKEY_DEFAULTS, migrate_hotkeys
 from core.pipeline import AppController
 from ui.overlay import TranslationOverlay
 from ui.selector import RegionSelector
@@ -130,6 +136,7 @@ from ui.settings_dialog import SettingsDialog
 from ui.theme import apply_theme
 from ui.tray import SystemTray
 from core.paths import config_path, log_path, user_data_dir, ensure_user_config
+from utils.dpi_geometry import logical_to_native
 
 # Уровень логирования — переключается переменной окружения TRANSLATEX_LOG=DEBUG
 _log_level_name = os.environ.get("TRANSLATEX_LOG", "INFO").upper()
@@ -174,13 +181,10 @@ def load_config() -> configparser.ConfigParser:
     config = configparser.ConfigParser()
     if CONFIG_PATH.exists():
         config.read(str(CONFIG_PATH), encoding="utf-8")
+    migrate_hotkeys(config)
     defaults = {
         "general": {
-            "hotkey_select": "ctrl+shift+t",
-            "hotkey_toggle": "ctrl+shift+p",
-            "hotkey_pause": "ctrl+shift+space",
-            "hotkey_copy": "ctrl+shift+c",
-            "hotkey_fullscreen": "ctrl+shift+f",
+            **HOTKEY_DEFAULTS,
             "capture_interval_ms": "1500",
             "cache_ttl_seconds": "3600",
             "cache_max_size": "500",
@@ -247,6 +251,11 @@ class App(QObject):
         super().__init__()
         self._config = config
         self._qapp = qapp
+        self._fullscreen_screen = None
+        self._selection_previous = None
+        self._shutting_down = False
+        self._workers_stopped = True
+        qapp.screenRemoved.connect(self._on_screen_removed)
 
         # Компоненты
         self._controller = AppController(config)
@@ -261,7 +270,6 @@ class App(QObject):
         self._tray = SystemTray()
 
         self._ocr_ready = False
-        self._hotkeys_registered = False
         self._hotkeys = None  # utils.hotkeys.GlobalHotkeys, создаётся лениво
 
         # Сигналы контроллера
@@ -282,9 +290,6 @@ class App(QObject):
         self._controller.ocr_progress.connect(self._frame.on_capture_done)
         self._controller.translation_progress.connect(self._frame.on_translation_done)
 
-        # Состояние рамки до открытия селектора (чтобы вернуть при отмене)
-        self._frame_visible_before_selector = False
-
         # Сигналы селектора → фрейм
         self._selector.region_selected.connect(self._on_region_selected)
         self._selector.cancelled.connect(self._on_selector_cancelled)
@@ -303,9 +308,13 @@ class App(QObject):
         self._frame.pause_toggle_requested.connect(self._controller.toggle_pause)
         # AppController «пингует» рамку, чтобы она показывала paused/resumed UI.
         self._controller.user_pause_changed.connect(self._frame.set_paused)
+        self._controller.user_pause_changed.connect(self._tray.set_paused)
 
         # Сигналы трея
         self._tray.select_region_requested.connect(self._show_selector)
+        self._tray.show_frame_requested.connect(self._restore_frame)
+        self._tray.copy_requested.connect(self._copy_last_translation)
+        self._tray.pause_toggle_requested.connect(self._controller.toggle_pause)
         self._tray.fullscreen_requested.connect(self._translate_fullscreen)
         self._tray.toggle_requested.connect(self._toggle_translation)
         self._tray.settings_requested.connect(self._show_settings)
@@ -313,11 +322,11 @@ class App(QObject):
 
         # PERF-003: OCR не грузится при старте приложения — только при первом
         # запуске перевода. Трей показывает нейтральное «ожидание».
+        self._update_shortcut_hints()
         self._tray.show()
-
-        QTimer.singleShot(500, self._register_hotkeys)
-        # Показываем рамку захвата сразу при запуске (Bandicam-style)
-        QTimer.singleShot(100, self._show_default_frame)
+        self._register_hotkeys()
+        self._show_default_frame()
+        self._qapp.aboutToQuit.connect(self._shutdown)
 
     # ── Overlay: режим окна и пересоздание ────────────────────────────
 
@@ -349,6 +358,12 @@ class App(QObject):
 
     # ── Горячие клавиши ──────────────────────────────────────────────
 
+    def _update_shortcut_hints(self) -> None:
+        keys = self._config["general"]
+        self._tray.set_shortcuts(*(keys.get(key, HOTKEY_DEFAULTS[key]) for key in (
+            "hotkey_select", "hotkey_toggle", "hotkey_fullscreen", "hotkey_copy")))
+        self._frame.set_pause_shortcut(keys.get("hotkey_pause", ""))
+
     def _register_hotkeys(self) -> None:
         """Глобальные хоткеи через Win32 RegisterHotKey (utils/hotkeys.py).
         Занятые или неразобранные сочетания не блокируют остальные —
@@ -356,33 +371,32 @@ class App(QObject):
         cfg = self._config
         bindings = [
             ("Выбор области",
-             cfg.get("general", "hotkey_select", fallback="ctrl+shift+t"),
+             cfg.get("general", "hotkey_select", fallback=HOTKEY_DEFAULTS["hotkey_select"]),
              self._show_selector),
             ("Вкл/выкл перевод",
-             cfg.get("general", "hotkey_toggle", fallback="ctrl+shift+p"),
+             cfg.get("general", "hotkey_toggle", fallback=""),
              self._toggle_translation),
             ("Пауза",
-             cfg.get("general", "hotkey_pause", fallback="ctrl+shift+space"),
+             cfg.get("general", "hotkey_pause", fallback=""),
              self._controller.toggle_pause),
             ("Скопировать перевод",
-             cfg.get("general", "hotkey_copy", fallback="ctrl+shift+c"),
+             cfg.get("general", "hotkey_copy", fallback=""),
              self._copy_last_translation),
             ("Перевести весь экран",
-             cfg.get("general", "hotkey_fullscreen", fallback="ctrl+shift+f"),
+             cfg.get("general", "hotkey_fullscreen", fallback=""),
              self._translate_fullscreen),
         ]
         try:
             if self._hotkeys is None:
                 from utils.hotkeys import GlobalHotkeys
-                self._hotkeys = GlobalHotkeys()
+                self._hotkeys = GlobalHotkeys(on_activate=self._restore_frame)
             self._hotkeys.unregister_all()
             problems = self._hotkeys.register_all(bindings)
         except Exception as e:
             logger.warning(f"Не удалось зарегистрировать горячие клавиши: {e}")
             return
-        self._hotkeys_registered = True
         logger.info(
-            "Горячие клавиши: " + ", ".join(f"{t}={h}" for t, h, _ in bindings)
+            "Горячие клавиши: " + ", ".join(f"{t}={h}" for t, h, _ in bindings if h)
         )
         if problems:
             for p in problems:
@@ -407,21 +421,52 @@ class App(QObject):
 
     @pyqtSlot()
     def _show_selector(self) -> None:
-        # Останавливаем перевод, но прячем рамку временно (чтобы вернуть при отмене)
-        self._frame_visible_before_selector = self._frame.isVisible()
-        if self._frame_visible_before_selector:
+        if self._selection_previous is not None or QApplication.activeModalWidget():
+            return
+        self._selection_previous = (
+            self._frame.isVisible(), self._controller._active,
+            self._controller._user_paused, self._fullscreen_screen)
+        if self._controller._active:
             self._stop_translation()
             self._frame.set_translating(False)
-            self._frame.hide()
+        self._frame.hide()
         self._selector.activate()
 
     @pyqtSlot()
     def _on_selector_cancelled(self) -> None:
         logger.info("Выбор области отменён")
-        # Возвращаем рамку, если она была показана до этого
-        if self._frame_visible_before_selector:
+        previous, self._selection_previous = self._selection_previous, None
+        if previous is None:
+            return
+        was_visible, active, paused, screen = previous
+        if was_visible:
             self._frame.show()
             self._frame.raise_()
+        if active:
+            if screen is not None and screen in self._qapp.screens():
+                self._start_fullscreen(screen)
+            elif was_visible:
+                self._start_translation()
+                self._frame.set_translating(True)
+            if paused and self._controller._active:
+                self._controller.toggle_pause()
+
+    @pyqtSlot()
+    def _restore_frame(self) -> None:
+        if self._shutting_down:
+            return
+        modal = QApplication.activeModalWidget()
+        if modal is not None:
+            modal.raise_()
+            modal.activateWindow()
+            return
+        if self._selection_previous is not None:
+            self._selector.cancel()
+        if self._fullscreen_screen is not None:
+            self._stop_translation()
+        self._frame.showNormal()
+        self._frame.raise_()
+        self._frame.activateWindow()
 
     def _show_default_frame(self) -> None:
         """Показываем рамку по центру ТОГО монитора, где сейчас курсор —
@@ -431,14 +476,14 @@ class App(QObject):
         cursor_pos = QCursor.pos()
         screen = QApplication.screenAt(cursor_pos) or QApplication.primaryScreen()
         avail = screen.availableGeometry()
-        w, h = 640, 220
+        w, h = min(640, avail.width() - 8), min(220, avail.height() - 80)
         rect = QRect(
             avail.x() + (avail.width() - w) // 2,
             avail.y() + (avail.height() - h) // 2,
             w, h,
         )
         # show_at сам эмитит region_changed → _on_region_moved → set_region
-        self._frame.show_at(rect)
+        self._frame.show_at(rect, screen)
         logger.info(
             f"Рамка захвата показана: {rect.width()}×{rect.height()} "
             f"на экране '{screen.name()}'"
@@ -447,14 +492,19 @@ class App(QObject):
     @pyqtSlot(QRect)
     def _on_region_selected(self, region: QRect) -> None:
         """Область выбрана → показываем фрейм Bandicam-style."""
+        self._selection_previous = None
+        if self._fullscreen_screen is not None:
+            self._stop_translation()
         # show_at сам эмитит region_changed → set_region
-        self._frame.show_at(region)
+        self._frame.show_at(region, self._selector.selected_screen)
         logger.info(f"Область закреплена: {region.width()}×{region.height()}")
 
     @pyqtSlot(QRect)
     def _on_region_moved(self, region: QRect) -> None:
         """Фрейм перемещён/ресайзнут — обновляем область захвата."""
-        self._controller.set_region(region)
+        if self._fullscreen_screen is None and self._frame.windowHandle() is not None:
+            if self._controller.set_region(region, self._frame.capture_native_rect()):
+                self._overlay.hide_overlay()
 
     # ── Старт / Стоп / Закрыть ───────────────────────────────────────
 
@@ -464,12 +514,17 @@ class App(QObject):
         # лениво поднимет worker, покажет «Загрузка OCR…» и начнёт переводить,
         # как только Reader догрузится (клик второй раз не нужен).
         region = self._frame.capture_rect()
-        self._controller.set_region(region)
+        self._on_region_moved(region)
         self._controller.start()
         self._tray.set_active(True)
 
     @pyqtSlot()
     def _stop_translation(self) -> None:
+        screen = self._fullscreen_screen
+        if screen is not None:
+            screen.geometryChanged.disconnect(self._refresh_fullscreen_region)
+            screen.logicalDotsPerInchChanged.disconnect(self._refresh_fullscreen_region)
+            self._fullscreen_screen = None
         self._controller.stop()
         self._overlay.hide_overlay()
         self._tray.set_active(False)
@@ -481,15 +536,17 @@ class App(QObject):
 
     @pyqtSlot()
     def _toggle_translation(self) -> None:
+        if self._selection_previous is not None:
+            return
         if self._controller._active:
             self._stop_translation()
             self._frame.set_translating(False)
         else:
+            if not self._frame.isVisible():
+                self._restore_frame()
             if self._frame.isVisible():
                 self._start_translation()
                 self._frame.set_translating(True)
-            else:
-                self._tray.set_status("Сначала выберите область (Ctrl+Shift+T)")
 
     # ── Результат перевода ───────────────────────────────────────────
 
@@ -505,7 +562,8 @@ class App(QObject):
             exclude_from_capture=self._config.getboolean(
                 "overlay", "exclude_from_capture", fallback=True),
         )
-        self._overlay.update_blocks(blocks, region)
+        screen = self._fullscreen_screen or self._frame.screen()
+        self._overlay.update_blocks(blocks, region, screen, self._controller.native_region)
 
     @pyqtSlot(str)
     def _on_translation_failed(self, reason: str) -> None:
@@ -527,22 +585,44 @@ class App(QObject):
     @pyqtSlot()
     def _translate_fullscreen(self) -> None:
         """Переводит весь монитор под курсором одним действием — рамка не
-        нужна. Остановка: Ctrl+Shift+P, двойной клик по трею или меню."""
+        нужна. Остановить перевод можно из меню трея."""
         from PyQt5.QtGui import QCursor
+        if self._selection_previous is not None or QApplication.activeModalWidget():
+            return
+        screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+        self._start_fullscreen(screen)
+
+    def _start_fullscreen(self, screen) -> None:
         self._stop_translation()
         self._frame.set_translating(False)
         self._frame.hide()
-        screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
-        geo = screen.geometry()
-        self._controller.set_region(QRect(geo))
+        self._fullscreen_screen = screen
+        screen.geometryChanged.connect(self._refresh_fullscreen_region)
+        screen.logicalDotsPerInchChanged.connect(self._refresh_fullscreen_region)
+        self._refresh_fullscreen_region()
         self._controller.start()
         self._tray.set_active(True)
         logger.info(
-            f"Полноэкранный перевод: {geo.width()}×{geo.height()} "
-            f"на экране '{screen.name()}'"
+            f"Полноэкранный перевод на экране '{screen.name()}'"
         )
 
-    # ── Копирование перевода (Ctrl+Shift+C) ──────────────────────────
+    def _refresh_fullscreen_region(self, *_args) -> None:
+        screen = self._fullscreen_screen
+        if screen is None:
+            return
+        logical = screen.geometry()
+        # Windows keeps monitor origins in physical pixels in Qt's desktop
+        # layout. Use native bounds to include the last row/column at 125% etc.
+        bounds = monitor_bounds_at(logical.x(), logical.y())
+        native = QRect(*bounds) if bounds else logical_to_native(logical, screen)
+        if self._controller.set_region(logical, native):
+            self._overlay.hide_overlay()
+
+    def _on_screen_removed(self, screen) -> None:
+        if screen == self._fullscreen_screen:
+            self._stop_translation()
+
+    # ── Копирование перевода ────────────────────────────────────────
 
     @pyqtSlot()
     def _copy_last_translation(self) -> None:
@@ -562,7 +642,7 @@ class App(QObject):
 
     @pyqtSlot()
     def _show_settings(self) -> None:
-        dialog = SettingsDialog(self._config)
+        dialog = SettingsDialog(self._config, self._frame if self._frame.isVisible() else None)
         dialog.settings_saved.connect(self._on_settings_saved)
         dialog.exec_()
 
@@ -582,21 +662,28 @@ class App(QObject):
         apply_theme(self._qapp, config.get("ui", "theme", fallback="auto"))
         # Перекрасить кастомную рамку (тулбар/бордюр рисуются вручную, не через QSS).
         self._frame.refresh_theme()
-        if self._hotkeys_registered:
-            self._register_hotkeys()  # снимает старые сочетания и ставит новые
+        self._update_shortcut_hints()
+        self._register_hotkeys()
 
     # ── Выход ────────────────────────────────────────────────────────
 
     @pyqtSlot()
     def _quit(self) -> None:
+        self._shutdown()
+        self._qapp.quit()
+
+    @pyqtSlot()
+    def _shutdown(self) -> None:
+        if self._shutting_down:
+            return
+        self._shutting_down = True
         logger.info("Завершение TranslateX")
         self._close_frame()
         self._overlay.hide()
         self._history.hide()
         if self._hotkeys is not None:
             self._hotkeys.close()
-        self._controller.shutdown()
-        self._qapp.quit()
+        self._workers_stopped = self._controller.shutdown()
 
 
 def _install_excepthook() -> None:
@@ -665,18 +752,17 @@ def _install_excepthook() -> None:
     _threading.excepthook = _thread_hook
 
 
+def create_qapplication(argv) -> QApplication:
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps)
+    QApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+    return QApplication(argv)
+
+
 def main() -> None:
     _install_excepthook()
-
-    # ВАЖНО: Qt high-DPI scaling ВЫКЛЮЧЕН.
-    # Причина: mss (захват экрана) работает в ФИЗИЧЕСКИХ пикселях, а если Qt
-    # выдаёт координаты в логических — frame.x()/y() и mss-захват рассинхронятся
-    # на HiDPI-мониторах (DPI 125/150%). В итоге mss захватывал область выше
-    # capture_rect и OCR читал тулбар самой рамки. Per-Monitor-V2 awareness
-    # уже включён через set_dpi_awareness() — этого достаточно.
-    QApplication.setAttribute(Qt.AA_DisableHighDpiScaling)
-
-    qapp = QApplication(sys.argv)
+    qapp = create_qapplication(sys.argv)
     qapp.setApplicationName("TranslateX")
     qapp.setQuitOnLastWindowClosed(False)
 
@@ -685,6 +771,12 @@ def main() -> None:
     from utils.win32_utils import acquire_single_instance
     instance_lock = acquire_single_instance("TranslateX.SingleInstance")
     if instance_lock is None:
+        # Simultaneous launches: allow the first process to create its receiver.
+        import time
+        for _ in range(40):
+            if request_existing_frame():
+                return
+            time.sleep(0.05)
         from PyQt5.QtWidgets import QMessageBox
         logger.info("TranslateX уже запущен — второй экземпляр завершается")
         QMessageBox.information(
@@ -700,6 +792,7 @@ def main() -> None:
     # U3: применение темы оформления (auto/light/dark) ДО создания виджетов.
     apply_theme(qapp, config.get("ui", "theme", fallback="auto"))
 
+    app = App(qapp, config)
     # A2: если при валидации config'а нашлись проблемы — показываем
     # неблокирующий QMessageBox.warning со списком (и тем, что починили).
     issues = getattr(config, "_validation_issues", []) or []
@@ -714,9 +807,14 @@ def main() -> None:
             "\n\nИсправленный конфиг сохранится при следующем 'Сохранить' в Настройках.",
         )
 
-    app = App(qapp, config)
-
-    sys.exit(qapp.exec_())
+    result = qapp.exec_()
+    if app._workers_stopped is False:
+        # Cache and child-process cleanup have finished. An uninterruptible
+        # native OCR call must not outlive its QThread during Qt destruction.
+        logger.warning("Завершение процесса после тайм-аута остановки фоновой задачи")
+        logging.shutdown()
+        os._exit(result)
+    sys.exit(result)
 
 
 if __name__ == "__main__":

@@ -22,6 +22,9 @@ def _make_default_icon(active: bool = False) -> QIcon:
 
 
 class SystemTray(QObject):
+    show_frame_requested = pyqtSignal()
+    pause_toggle_requested = pyqtSignal()
+    copy_requested = pyqtSignal()
     select_region_requested = pyqtSignal()
     fullscreen_requested = pyqtSignal()
     toggle_requested = pyqtSignal()
@@ -31,6 +34,7 @@ class SystemTray(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._active = False
+        self._shortcut_hints = []
         self._tray = QSystemTrayIcon(parent)
         self._tray.setToolTip(f"TranslateX v{__version__} — ожидание")
         self._build_menu()
@@ -39,9 +43,18 @@ class SystemTray(QObject):
     def _build_menu(self) -> None:
         menu = QMenu()
 
+        show_frame = menu.addAction("Показать рамку")
+        show_frame.triggered.connect(self.show_frame_requested)
+        menu.setDefaultAction(show_frame)
+
         self._action_toggle = QAction("▶  Начать перевод", menu)
         self._action_toggle.triggered.connect(self.toggle_requested)
         menu.addAction(self._action_toggle)
+
+        self._action_pause = menu.addAction("Пауза")
+        self._action_pause.setEnabled(False)
+        self._action_pause.triggered.connect(self.pause_toggle_requested)
+        menu.addAction("Скопировать перевод").triggered.connect(self.copy_requested)
 
         action_select = QAction("🔲  Выбрать область", menu)
         action_select.triggered.connect(self.select_region_requested)
@@ -67,8 +80,18 @@ class SystemTray(QObject):
         self._tray.activated.connect(self._on_activated)
 
     def _on_activated(self, reason) -> None:
-        if reason == QSystemTrayIcon.DoubleClick:
-            self.toggle_requested.emit()
+        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+            self.show_frame_requested.emit()
+
+    def set_shortcuts(self, select: str, toggle: str, fullscreen: str, copy: str) -> None:
+        self._shortcut_hints = [
+            f"{key} — {label}" for key, label in (
+                (select, "выбрать область экрана"),
+                (toggle, "начать/остановить перевод"),
+                (fullscreen, "перевести весь экран"),
+                (copy, "скопировать перевод"),
+            ) if key
+        ]
 
     def _update_icon(self) -> None:
         icon_path = Path(__file__).parent.parent / "assets" / "icon.png"
@@ -82,17 +105,16 @@ class SystemTray(QObject):
         self._tray.show()
         self._tray.showMessage(
             "TranslateX",
-            "Приложение работает в трее.\n"
-            "Ctrl+Shift+T — выбрать область экрана\n"
-            "Ctrl+Shift+F — перевести весь экран\n"
-            "Ctrl+Shift+P — начать/остановить перевод\n"
-            "Ctrl+Shift+C — скопировать перевод",
+            "\n".join(["Щёлкните значок, чтобы показать рамку.", *self._shortcut_hints]),
             QSystemTrayIcon.Information,
             4000,
         )
 
     def set_active(self, active: bool) -> None:
         self._active = active
+        self._action_pause.setEnabled(active)
+        if not active:
+            self.set_paused(False)
         self._action_toggle.setText(
             "⏹  Остановить перевод" if active else "▶  Начать перевод"
         )
@@ -102,6 +124,9 @@ class SystemTray(QObject):
         )
         self._tray.setToolTip(tooltip)
         self._update_icon()
+
+    def set_paused(self, paused: bool) -> None:
+        self._action_pause.setText("Возобновить перевод" if paused else "Пауза")
 
     def set_status(self, message: str) -> None:
         self._tray.setToolTip(f"TranslateX v{__version__} — {message}")

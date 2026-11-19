@@ -38,9 +38,8 @@ def make_config() -> configparser.ConfigParser:
     c = configparser.ConfigParser()
     c.read_dict({
         "general": {
-            "hotkey_select": "ctrl+shift+t", "hotkey_toggle": "ctrl+shift+p",
-            "hotkey_pause": "ctrl+shift+space", "hotkey_copy": "ctrl+shift+c",
-            "hotkey_fullscreen": "ctrl+shift+f",
+            "hotkey_select": "", "hotkey_toggle": "", "hotkey_pause": "",
+            "hotkey_copy": "", "hotkey_fullscreen": "",
             "capture_interval_ms": "1500",
             "cache_ttl_seconds": "3600", "cache_max_size": "500",
         },
@@ -64,8 +63,12 @@ def make_config() -> configparser.ConfigParser:
 
 def screenshot(name: str) -> Path:
     from core.capture import capture_region
-    x, y, w, h = SHOT
-    img = capture_region(x, y, w, h)
+    from PyQt5.QtCore import QRect
+    from PyQt5.QtWidgets import QApplication
+    from utils.dpi_geometry import logical_to_native
+    rect = QRect(*SHOT)
+    screen = QApplication.screenAt(rect.center()) or QApplication.primaryScreen()
+    img = capture_region(*logical_to_native(rect, screen).getRect())
     path = OUTDIR / name
     img.save(str(path))
     print(f"[e2e] screenshot: {path}")
@@ -77,9 +80,9 @@ def main() -> int:
 
     from PyQt5.QtCore import QRect, Qt, QTimer
     from PyQt5.QtGui import QFont
-    from PyQt5.QtWidgets import QApplication, QLabel
+    from PyQt5.QtWidgets import QLabel
 
-    qapp = QApplication(sys.argv[:1])
+    qapp = app_main.create_qapplication(sys.argv[:1])
     qapp.setQuitOnLastWindowClosed(False)
 
     # ── Контент: окно с английским текстом ────────────────────────────
