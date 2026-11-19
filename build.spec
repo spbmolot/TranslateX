@@ -22,6 +22,7 @@ if os.name == "nt":
 added_files = [
     (str(ROOT / "config.ini"),    "."),
     (str(ROOT / "assets"),        "assets"),
+    (str(ROOT / "third_party"),   "third_party"),
 ]
 
 # EasyOCR detection models — included only if already downloaded

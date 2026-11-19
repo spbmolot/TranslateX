@@ -2,6 +2,13 @@
 
 TranslateX распознаёт текст в выбранной области экрана Windows и показывает перевод поверх оригинала. Можно переводить субтитры, диалоги в играх и текст в программах, где его нельзя выделить мышью. По умолчанию приложение переводит на русский через Google Translate.
 
+## Скачать для Windows
+
+**TranslateX 1.0.2** для Windows 10 и 11 (x64). Python уже входит в сборку.
+
+- [Скачать установщик (.exe)](https://github.com/spbmolot/TranslateX/releases/download/v1.0.2/TranslateX_Setup_1.0.2.exe) — запустите файл и следуйте подсказкам.
+- [Скачать переносимую версию (.zip)](https://github.com/spbmolot/TranslateX/releases/download/v1.0.2/TranslateX.zip) — распакуйте архив целиком и откройте `TranslateX.exe` в папке `TranslateX`.
+
 ## Запуск из исходников
 
 Проверено на Windows x64 с Python 3.12. Скачайте исходники через **Code → Download ZIP** и распакуйте архив либо клонируйте репозиторий командой `git clone https://github.com/spbmolot/TranslateX.git`. Откройте PowerShell в папке с `main.py` и выполните команды по порядку.
