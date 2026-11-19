@@ -1,9 +1,10 @@
 """
 АВТОСГЕНЕРИРОВАНО scripts/vendor_easyocr_utils.py — НЕ ПРАВИТЬ РУКАМИ.
 
-Torch-free функции из EasyOCR 1.7.2 (https://github.com/JaidedAI/EasyOCR),
-лицензия Apache-2.0, (c) JaidedAI. Скопированы дословно, чтобы ONNX-бэкенд
-не импортировал пакет easyocr (его __init__ тянет torch).
+Функции из EasyOCR 1.7.2 (https://github.com/JaidedAI/EasyOCR), (c) JaidedAI,
+Apache-2.0. Функции из craft_utils и imgproc происходят из CRAFT,
+Copyright (c) 2019-present NAVER Corp., MIT. Тексты лицензий находятся в third_party/.
+Функции скопированы, чтобы ONNX-бэкенд мог работать без импорта torch.
 """
 import math
 
